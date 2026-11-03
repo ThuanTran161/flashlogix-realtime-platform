@@ -1,0 +1,43 @@
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache & compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE & Editor settings
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Environment & Sensitive Credentials
+.env
+.env.local
+*.pem
+*.key
+
+# Spark / Lakehouse Checkpoints & Warehouses
+checkpoints/
+*_chk/
+.checkpoint/
+spark-warehouse/
+metastore_db/
+derby.log
+
+# MinIO / Local persistent storage
+miniodata/
+pgdata/
+redisdata/
+
+# OS specific files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,102 @@
+name: flashlogix_platform
+
+services:
+  # Relational Database for OLTP Transactions & Gold Star Schema
+  postgres:
+    image: postgres:15-alpine
+    container_name: flashlogix_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password123}
+      POSTGRES_DB: ${POSTGRES_DB:-flashlogix_db}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - flashlogix_pgdata:/var/lib/postgresql/data
+      - ./streaming/star_schema.sql:/docker-entrypoint-initdb.d/01_star_schema.sql:ro
+    networks:
+      - flashlogix_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-flashlogix_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # In-Memory Cache for Atomic Inventory Control (Port 6380 isolated from local 6379)
+  redis:
+    image: redis:7.2-alpine
+    container_name: flashlogix_redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - flashlogix_redisdata:/data
+    networks:
+      - flashlogix_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Apache Kafka 4.x Broker in KRaft Mode (Port 9094 isolated from local 9092)
+  kafka:
+    image: apache/kafka:4.3.1
+    container_name: flashlogix_kafka
+    restart: unless-stopped
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9094,PLAINTEXT_INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9094,PLAINTEXT_INTERNAL://flashlogix_kafka:29092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@flashlogix_kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - flashlogix_kafkadata:/var/lib/kafka/data
+    networks:
+      - flashlogix_net
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:29092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # MinIO Object Storage (S3-Compatible Lakehouse)
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    container_name: flashlogix_minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadminpassword}
+    command: ["server", "/data", "--console-address", ":9001"]
+    volumes:
+      - flashlogix_miniodata:/data
+    networks:
+      - flashlogix_net
+
+networks:
+  flashlogix_net:
+    name: flashlogix_net
+    driver: bridge
+
+volumes:
+  flashlogix_pgdata:
+  flashlogix_redisdata:
+  flashlogix_kafkadata:
+  flashlogix_miniodata:
