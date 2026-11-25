@@ -82,6 +82,9 @@ export function LakehouseTab({ overview, onRefresh }: Props) {
     : [];
 
   const tierChart = overview?.gold?.tiers ?? [];
+  const pendingGoldOrders = overview?.gold
+    ? Math.max(0, overview.oltp.total_orders - overview.gold.fact_orders)
+    : 0;
 
   return (
     <div className="space-y-5">
@@ -134,7 +137,8 @@ export function LakehouseTab({ overview, onRefresh }: Props) {
           <div className="mt-3 space-y-1.5 rounded-md border border-slate-200 bg-slate-50 p-3 dark:border-zinc-800 dark:bg-zinc-950">
             <div className="flex items-center justify-between text-xs font-mono">
               <span>
-                Silver Job: <strong>{silverJob.status}</strong>
+                Silver Job: <strong>{silverJob.status}</strong>{" "}
+                <span className="text-[11px] font-normal text-slate-500">(Spark window theo giờ UTC)</span>
               </span>
               {silverJob.duration_sec !== null && <span>{silverJob.duration_sec}s</span>}
             </div>
@@ -179,6 +183,17 @@ export function LakehouseTab({ overview, onRefresh }: Props) {
                   <div className="text-[11px] text-slate-500">Fact Orders</div>
                   <div className="font-mono text-base font-semibold num">
                     {overview.gold.fact_orders.toLocaleString()}
+                  </div>
+                  <div
+                    className={`mt-0.5 text-[10px] ${
+                      pendingGoldOrders > 0
+                        ? "text-amber-600 dark:text-amber-400"
+                        : "text-emerald-600 dark:text-emerald-400"
+                    }`}
+                  >
+                    {pendingGoldOrders > 0
+                      ? `+${pendingGoldOrders} đơn mới chờ Gold ETL`
+                      : `Khớp 100% OLTP (${overview.oltp.total_orders})`}
                   </div>
                 </div>
                 <div className="rounded border border-slate-100 bg-slate-50 p-2.5 dark:border-zinc-800 dark:bg-zinc-950">

@@ -112,3 +112,12 @@ export async function fetchSilverJob(): Promise<ApiResult<Envelope<SilverJobStat
 export function generateKey(prefix = "ui"): string {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
 }
+
+export function formatLocalDateTime(iso: string | null | undefined): string {
+  if (!iso) return "-";
+  const trimmed = iso.trim();
+  const hasTz = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(trimmed);
+  const d = new Date(hasTz ? trimmed : `${trimmed}Z`);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString("vi-VN", { hour12: false });
+}

@@ -107,8 +107,8 @@ def _get_overview_sync() -> Dict[str, Any]:
             "status": str(r[2]),
             "attempts": int(r[3]),
             "last_error": r[4],
-            "created_at": r[5].isoformat() if r[5] else None,
-            "published_at": r[6].isoformat() if r[6] else None,
+            "created_at": (r[5].replace(tzinfo=timezone.utc) if r[5].tzinfo is None else r[5]).isoformat() if r[5] else None,
+            "published_at": (r[6].replace(tzinfo=timezone.utc) if r[6].tzinfo is None else r[6]).isoformat() if r[6] else None,
         }
         for r in recent_outbox
     ]

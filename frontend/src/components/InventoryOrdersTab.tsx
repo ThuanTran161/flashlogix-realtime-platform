@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { CheckCircle2, Receipt, Search, Warehouse, XCircle } from "lucide-react";
-import { fetchOrders } from "../api";
+import { fetchOrders, formatLocalDateTime } from "../api";
 import type { InventoryItem, OrderRecord } from "../types";
 
 interface Props {
@@ -161,7 +161,7 @@ export function InventoryOrdersTab({ inventory }: Props) {
                     </span>
                   </td>
                   <td className="py-1.5 font-mono text-[11px] text-slate-500">
-                    {new Date(o.created_at).toLocaleString()}
+                    {formatLocalDateTime(o.created_at)}
                   </td>
                 </tr>
               ))}

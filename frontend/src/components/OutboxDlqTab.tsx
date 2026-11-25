@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { AlertTriangle, MailCheck, RotateCcw } from "lucide-react";
-import { apiRequest, fetchQuarantine } from "../api";
+import { apiRequest, fetchQuarantine, formatLocalDateTime } from "../api";
 import type { OpsOverview, QuarantineResponse } from "../types";
 
 interface Props {
@@ -133,7 +133,7 @@ export function OutboxDlqTab({ overview, onRefresh }: Props) {
                     {r.last_error ?? "-"}
                   </td>
                   <td className="py-1.5 font-mono text-[11px] text-slate-500">
-                    {r.published_at ? new Date(r.published_at).toLocaleString() : "-"}
+                    {formatLocalDateTime(r.published_at)}
                   </td>
                 </tr>
               ))}

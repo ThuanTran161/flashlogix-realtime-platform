@@ -53,7 +53,7 @@ export default function App() {
     else setHealth(null);
     if (m.ok) setMetrics(m.data);
     if (o.ok && o.data?.data) setOverview(o.data.data);
-    setLastUpdated(new Date().toLocaleTimeString());
+    setLastUpdated(new Date().toLocaleTimeString("vi-VN", { hour12: false }));
     setLoading(false);
   }, []);
 
