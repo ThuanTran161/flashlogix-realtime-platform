@@ -1,0 +1,159 @@
+import uuid
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import text
+
+from app.core.config import settings
+from app.core.database import Base, SessionLocal, engine
+from app.main import app
+from app.models.order import Order
+from app.models.product import Product
+from app.services.inventory_service import inventory_service, redis_client
+from app.schemas.order import OrderCreate
+from app.schemas.product import ProductCreate
+
+@pytest.fixture(scope="module", autouse=True)
+def setup_test_db():
+    Base.metadata.create_all(bind=engine)
+    yield
+
+
+client = TestClient(app)
+
+
+def test_settings_load():
+    """Verifies environment settings are loaded and typed correctly."""
+    assert settings.APP_NAME == "FlashLogix"
+    assert settings.PORT == 8000
+    assert "postgresql://" in settings.get_database_url()
+
+
+def test_health_check_endpoint():
+    """Verifies FastAPI health check endpoint reports UP and dependency telemetry."""
+    response = client.get("/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "UP"
+    assert data["app"] == "FlashLogix"
+    assert "services" in data
+
+
+def test_pydantic_order_validation():
+    """Verifies Pydantic v2 validation constraints on Order schema."""
+    valid_payload = OrderCreate(user_id="user_123", product_id=1, quantity=2)
+    assert valid_payload.user_id == "user_123"
+    assert valid_payload.quantity == 2
+
+    with pytest.raises(Exception):
+        OrderCreate(user_id="user_123", product_id=1, quantity=-1)
+
+
+def test_pydantic_product_validation():
+    """Verifies product validation schema."""
+    valid_product = ProductCreate(name="iPhone 16 Pro Max", price=1299.99, stock=100)
+    assert valid_product.stock == 100
+    assert valid_product.price == 1299.99
+
+    with pytest.raises(Exception):
+        ProductCreate(name="Bad Price", price=-10.0, stock=10)
+
+
+def test_redis_atomic_lua_decrement_and_rollback():
+    """Tests Redis Lua atomic decrement, out-of-stock guard, and compensatory rollback."""
+    test_pid = 99991
+    redis_client.delete(f"stock:product:{test_pid}")
+
+    # Cache miss returns (False, -2)
+    ok, code = inventory_service.deduct_stock_atomic(test_pid, 1)
+    assert ok is False
+    assert code == -2
+
+    # Initialize stock = 2
+    inventory_service.initialize_stock(test_pid, 2)
+    assert inventory_service.get_stock(test_pid) == 2
+
+    # Deduct 1 -> remaining 1
+    ok, rem = inventory_service.deduct_stock_atomic(test_pid, 1)
+    assert ok is True
+    assert rem == 1
+
+    # Deduct 2 when only 1 left -> rejected (-1), stock remains 1
+    ok, code = inventory_service.deduct_stock_atomic(test_pid, 2)
+    assert ok is False
+    assert code == -1
+    assert inventory_service.get_stock(test_pid) == 1
+
+    # Compensatory increment restores stock
+    restored = inventory_service.compensatory_increment(test_pid, 1)
+    assert restored == 2
+    redis_client.delete(f"stock:product:{test_pid}")
+
+
+def test_order_idempotency_and_zero_overselling_flow():
+    """Integration test: Create product -> Idempotent order -> Oversell prevention."""
+    prod_resp = client.post(
+        "/api/v1/products",
+        json={"name": f"Test Flash Item {uuid.uuid4().hex[:6]}", "price": 99.5, "stock": 1},
+    )
+    assert prod_resp.status_code == 201
+    product_id = prod_resp.json()["data"]["id"]
+
+    idem_key = f"idem_{uuid.uuid4().hex}"
+    headers = {"Idempotency-Key": idem_key}
+
+    # First order succeeds
+    r1 = client.post(
+        "/api/v1/orders",
+        json={"user_id": "test_buyer_1", "product_id": product_id, "quantity": 1},
+        headers=headers,
+    )
+    assert r1.status_code == 201
+    order_id_1 = r1.json()["data"]["id"]
+    assert r1.json()["data"]["total_amount"] == 99.5
+
+    # Retry with same Idempotency-Key returns same order without deducting stock again
+    r2 = client.post(
+        "/api/v1/orders",
+        json={"user_id": "test_buyer_1", "product_id": product_id, "quantity": 1},
+        headers=headers,
+    )
+    assert r2.status_code == 201
+    assert r2.json()["data"]["id"] == order_id_1
+
+    # Second distinct buyer fails with INSUFFICIENT_STOCK (standard error envelope)
+    r3 = client.post(
+        "/api/v1/orders",
+        json={"user_id": "test_buyer_2", "product_id": product_id, "quantity": 1},
+        headers={"Idempotency-Key": f"idem_{uuid.uuid4().hex}"},
+    )
+    assert r3.status_code == 400
+    assert r3.json()["error_code"] == "INSUFFICIENT_STOCK"
+    assert inventory_service.get_stock(product_id) == 0
+
+
+def test_compensatory_rollback_on_db_failure(monkeypatch):
+    """Verifies Redis stock is automatically restored if PostgreSQL commit fails."""
+    prod_resp = client.post(
+        "/api/v1/products",
+        json={"name": f"Rollback Item {uuid.uuid4().hex[:6]}", "price": 50.0, "stock": 5},
+    )
+    assert prod_resp.status_code == 201
+    product_id = prod_resp.json()["data"]["id"]
+
+    from sqlalchemy.orm import Session
+
+    def failing_commit(self):
+        raise RuntimeError("Simulated PostgreSQL outage")
+
+    monkeypatch.setattr(Session, "commit", failing_commit)
+
+    resp = client.post(
+        "/api/v1/orders",
+        json={"user_id": "rollback_user", "product_id": product_id, "quantity": 2},
+        headers={"Idempotency-Key": f"idem_{uuid.uuid4().hex}"},
+    )
+    assert resp.status_code == 500
+    assert resp.json()["error_code"] == "DATABASE_ERROR"
+
+    # Crucial assertion: Redis stock must still be 5 after compensatory INCRBY
+    assert inventory_service.get_stock(product_id) == 5
