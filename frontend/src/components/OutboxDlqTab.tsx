@@ -104,8 +104,8 @@ export function OutboxDlqTab({ overview, onRefresh }: Props) {
           <table className="w-full border-collapse text-left text-xs">
             <thead>
               <tr className="border-b border-slate-200 text-slate-500 dark:border-zinc-800 dark:text-zinc-400">
-                <th className="py-2 pr-3 font-medium">ID</th>
-                <th className="py-2 pr-3 font-medium">Aggregate</th>
+                <th className="py-2 pr-3 font-medium">Order ID</th>
+                <th className="py-2 pr-3 font-medium">Outbox ID</th>
                 <th className="py-2 pr-3 font-medium">Status</th>
                 <th className="py-2 pr-3 font-medium text-right">Attempts</th>
                 <th className="py-2 pr-3 font-medium">Last Error</th>
@@ -115,8 +115,8 @@ export function OutboxDlqTab({ overview, onRefresh }: Props) {
             <tbody className="divide-y divide-slate-100 dark:divide-zinc-800/70">
               {rows.map((r) => (
                 <tr key={r.id}>
-                  <td className="py-1.5 pr-3 font-mono num">#{r.id}</td>
-                  <td className="py-1.5 pr-3 font-mono">{r.aggregate_id}</td>
+                  <td className="py-1.5 pr-3 font-mono font-medium num">#{r.aggregate_id}</td>
+                  <td className="py-1.5 pr-3 font-mono text-slate-500 num">#{r.id}</td>
                   <td className="py-1.5 pr-3">
                     <span
                       className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
