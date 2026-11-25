@@ -27,7 +27,9 @@ Base = declarative_base()
 
 
 def ensure_oltp_schema_and_constraints() -> None:
-    """Creates OLTP tables and idempotently enforces defense-in-depth CHECK constraints."""
+    """Creates OLTP tables (including Outbox) and idempotently enforces CHECK constraints."""
+    import app.models  # noqa: F401
+
     Base.metadata.create_all(bind=engine)
     constraints = [
         ("products", "ck_products_stock_non_negative", "CHECK (stock >= 0)"),

@@ -1,5 +1,5 @@
 from typing import List
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 from app.core.config import settings
@@ -13,8 +13,8 @@ from app.services.inventory_service import inventory_service
 router = APIRouter(prefix="/products", tags=["Products"])
 
 
-def _list_products_sync(db: Session) -> List[ProductResponse]:
-    products = db.query(Product).order_by(Product.id.asc()).all()
+def _list_products_sync(db: Session, limit: int, offset: int) -> List[ProductResponse]:
+    products = db.query(Product).order_by(Product.id.asc()).offset(offset).limit(limit).all()
     results: List[ProductResponse] = []
     for p in products:
         if settings.CONCURRENCY_MODE != "db_only":
@@ -86,10 +86,14 @@ def _init_stock_sync(product_id: int, initial_stock: int, db: Session) -> dict:
 @router.get(
     "",
     response_model=StandardResponse[List[ProductResponse]],
-    summary="List All Products with Real-Time Stock",
+    summary="List Products with Real-Time Stock & Pagination",
 )
-async def list_products(db: Session = Depends(get_db)):
-    items = await run_in_threadpool(_list_products_sync, db)
+async def list_products(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    items = await run_in_threadpool(_list_products_sync, db, limit, offset)
     return StandardResponse(
         success=True,
         message=f"Retrieved {len(items)} products.",

@@ -69,7 +69,7 @@ def _stop_server_process(proc: subprocess.Popen) -> None:
 
 
 def reset_clean_environment(initial_stock: int = 100) -> None:
-    """Resets OLTP, Gold Star Schema, Redis, MinIO prefixes, and Kafka topics cleanly."""
+    """Resets OLTP, Outbox, Gold Star Schema, Redis, MinIO prefixes, and Kafka topics cleanly."""
     logger.info("[RESET] Cleaning PostgreSQL OLTP/Gold, Redis, MinIO, and Kafka topics...")
     ensure_oltp_schema_and_constraints()
     with engine.begin() as conn:
@@ -78,6 +78,7 @@ def reset_clean_environment(initial_stock: int = 100) -> None:
             "Dim_Users",
             "Dim_Products",
             "Dim_Date",
+            "outbox_events",
             "orders",
             "products",
         ]:
@@ -180,6 +181,7 @@ def run_single_benchmark(
         stderr=subprocess.DEVNULL,
     )
 
+    outbox_pending_or_failed = 0
     try:
         wait_for_health(base_url, timeout_sec=30.0)
         init_product_stock_via_api(base_url, stock=stock)
@@ -222,13 +224,42 @@ def run_single_benchmark(
             logger.error(f"[LOCUST_STDERR] {locust_proc.stderr}")
             raise RuntimeError(f"Locust failed with exit code {locust_proc.returncode}")
 
-        # Wait briefly for all BackgroundTasks to complete Kafka delivery flush
-        time.sleep(2.5)
+        # Wait for BackgroundTasks Kafka delivery + telemetry 250ms tail flush
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
+            with engine.connect() as conn:
+                pending = int(
+                    conn.execute(
+                        text("SELECT COUNT(*) FROM outbox_events WHERE status = 'PENDING'")
+                    ).scalar()
+                    or 0
+                )
+            if pending == 0:
+                break
+            time.sleep(0.25)
+        time.sleep(0.6)
+
+        try:
+            with urllib.request.urlopen(f"{base_url}/metrics", timeout=3.0) as mresp:
+                metrics_payload = json.loads(mresp.read().decode("utf-8"))
+                outbox_pending_or_failed = int(
+                    metrics_payload.get("outbox_pending_or_failed", 0)
+                )
+        except Exception:
+            pass
 
         with engine.connect() as conn:
             orders_after = int(conn.execute(text("SELECT COUNT(*) FROM orders")).scalar() or 0)
             db_stock = int(
                 conn.execute(text("SELECT stock FROM products WHERE id = 1")).scalar() or 0
+            )
+            outbox_pending_or_failed = int(
+                conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM outbox_events WHERE status IN ('PENDING', 'FAILED')"
+                    )
+                ).scalar()
+                or 0
             )
     finally:
         _stop_server_process(server_proc)
@@ -273,10 +304,12 @@ def run_single_benchmark(
         "orders_created": orders_created,
         "oversold_count": max(0, orders_created - stock),
         "remaining_db_stock": db_stock,
+        "outbox_pending_or_failed": outbox_pending_or_failed,
     }
     logger.info(
         f"[RESULT] mode={mode} | RPS={rps} | reqs={total_reqs} | fails={failures} | "
-        f"P50={p50}ms | P95={p95}ms | P99={p99}ms | orders_created={orders_created}/{stock}"
+        f"P50={p50}ms | P95={p95}ms | P99={p99}ms | orders_created={orders_created}/{stock} | "
+        f"outbox_pending_or_failed={outbox_pending_or_failed}"
     )
     return result
 

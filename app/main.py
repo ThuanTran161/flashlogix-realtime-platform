@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     try:
         ensure_oltp_schema_and_constraints()
-        logger.info("Database schemas and CHECK constraints verified and synchronized.")
+        logger.info("Database schemas, Outbox, and CHECK constraints verified and synchronized.")
     except Exception as exc:
         logger.warning(f"Database unavailable on startup: {exc}")
 
@@ -56,6 +56,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     logger.info("Shutting down FlashLogix Transaction Engine...")
+    telemetry.flush_to_redis()
     event_publisher.flush(timeout=5.0)
     await inventory_service.close_async()
     redis_client.close()
@@ -64,7 +65,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(
     title=settings.APP_NAME,
     description="High-Concurrency Flash Sale Transaction Engine & Real-time Event Analytics Platform",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -155,9 +156,18 @@ def _collect_system_metrics() -> dict:
         "overflow": getattr(pool, "overflow", lambda: 0)(),
     }
     oltp_orders = 0
+    outbox_pending_or_failed = 0
     try:
         with engine.connect() as conn:
             oltp_orders = int(conn.execute(text("SELECT COUNT(*) FROM orders")).scalar() or 0)
+            outbox_pending_or_failed = int(
+                conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM outbox_events WHERE status IN ('PENDING', 'FAILED')"
+                    )
+                ).scalar()
+                or 0
+            )
     except Exception:
         pass
 
@@ -174,6 +184,7 @@ def _collect_system_metrics() -> dict:
         "counters": snap["counters"],
         "db_pool": db_pool,
         "oltp_orders_total": oltp_orders,
+        "outbox_pending_or_failed": outbox_pending_or_failed,
         "product_1_redis_stock": redis_stock_p1,
     }
 
@@ -199,6 +210,7 @@ async def metrics_endpoint(format: str = "json"):
         lines = [
             f"flashlogix_uptime_seconds {data['uptime_seconds']}",
             f"flashlogix_oltp_orders_total {data['oltp_orders_total']}",
+            f"flashlogix_outbox_pending_or_failed {data['outbox_pending_or_failed']}",
             f"flashlogix_db_pool_checked_out {data['db_pool']['checked_out']}",
             f"flashlogix_db_pool_checked_in {data['db_pool']['checked_in']}",
         ]

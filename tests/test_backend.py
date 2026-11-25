@@ -7,6 +7,7 @@ from sqlalchemy import text
 from app.core.config import settings
 from app.core.database import SessionLocal, engine, ensure_oltp_schema_and_constraints
 from app.main import app
+from app.models.outbox import OutboxEvent
 from app.schemas.order import OrderCreate
 from app.schemas.product import ProductCreate
 from app.services.inventory_service import inventory_service, redis_client
@@ -25,6 +26,13 @@ def setup_test_db():
     if _created_test_product_ids:
         with engine.begin() as conn:
             for pid in _created_test_product_ids:
+                conn.execute(
+                    text(
+                        "DELETE FROM outbox_events WHERE aggregate_id IN "
+                        "(SELECT CAST(id AS VARCHAR) FROM orders WHERE product_id = :pid)"
+                    ),
+                    {"pid": pid},
+                )
                 conn.execute(text("DELETE FROM orders WHERE product_id = :pid"), {"pid": pid})
                 conn.execute(text("DELETE FROM products WHERE id = :pid"), {"pid": pid})
                 redis_client.delete(f"stock:product:{pid}", f"product:meta:{pid}")
@@ -58,12 +66,14 @@ def test_health_and_observability_endpoints():
     m_data = m_json.json()
     assert "counters" in m_data
     assert "db_pool" in m_data
+    assert "outbox_pending_or_failed" in m_data
     assert m_data["counters"]["http_requests_total"] >= 1
 
     m_prom = client.get("/metrics?format=prometheus")
     assert m_prom.status_code == 200
     assert "flashlogix_uptime_seconds" in m_prom.text
     assert "flashlogix_oltp_orders_total" in m_prom.text
+    assert "flashlogix_outbox_pending_or_failed" in m_prom.text
 
 
 def test_pydantic_order_validation():
@@ -118,7 +128,7 @@ def test_redis_atomic_lua_decrement_and_rollback():
 
 
 def test_order_idempotency_query_and_lazy_db_skip(monkeypatch):
-    """Tests Create Product -> List Products -> Order -> Get Order -> Idempotency & Lazy DB Skip."""
+    """Tests Product/Order pagination, filters, Outbox publish, Idempotency & Lazy DB Skip."""
     published_events = []
     monkeypatch.setattr(
         event_publisher,
@@ -134,18 +144,22 @@ def test_order_idempotency_query_and_lazy_db_skip(monkeypatch):
     product_id = prod_resp.json()["data"]["id"]
     _created_test_product_ids.append(product_id)
 
-    # Verify list products endpoint includes created product
-    list_resp = client.get("/api/v1/products")
+    # Verify paginated product list endpoint
+    list_resp = client.get("/api/v1/products?limit=200&offset=0")
     assert list_resp.status_code == 200
     assert any(item["id"] == product_id for item in list_resp.json()["data"])
+    paged_one = client.get("/api/v1/products?limit=1&offset=0")
+    assert paged_one.status_code == 200
+    assert len(paged_one.json()["data"]) <= 1
 
+    buyer_id = f"test_buyer_{uuid.uuid4().hex[:6]}"
     idem_key = f"idem_{uuid.uuid4().hex}"
     headers = {"Idempotency-Key": idem_key}
 
     # First order succeeds
     r1 = client.post(
         "/api/v1/orders",
-        json={"user_id": "test_buyer_1", "product_id": product_id, "quantity": 1},
+        json={"user_id": buyer_id, "product_id": product_id, "quantity": 1},
         headers=headers,
     )
     assert r1.status_code == 201
@@ -153,10 +167,24 @@ def test_order_idempotency_query_and_lazy_db_skip(monkeypatch):
     assert r1.json()["data"]["total_amount"] == 99.5
     assert len(published_events) == 1
 
-    # Verify GET /api/v1/orders/{order_id}
+    # Verify OutboxEvent transitioned to PUBLISHED
+    db = SessionLocal()
+    try:
+        ob = db.query(OutboxEvent).filter(OutboxEvent.aggregate_id == str(order_id_1)).first()
+        assert ob is not None
+        assert ob.status == "PUBLISHED"
+    finally:
+        db.close()
+
+    # Verify GET /api/v1/orders/{order_id} and filtered GET /api/v1/orders
     get_order_resp = client.get(f"/api/v1/orders/{order_id_1}")
     assert get_order_resp.status_code == 200
     assert get_order_resp.json()["data"]["id"] == order_id_1
+
+    list_orders_resp = client.get(f"/api/v1/orders?user_id={buyer_id}&limit=10&offset=0")
+    assert list_orders_resp.status_code == 200
+    assert len(list_orders_resp.json()["data"]) == 1
+    assert list_orders_resp.json()["data"][0]["id"] == order_id_1
 
     # Patch SessionLocal on the actual modules to prove retries & rejections NEVER touch PostgreSQL
     order_service_mod = sys.modules["app.services.order_service"]
@@ -171,7 +199,7 @@ def test_order_idempotency_query_and_lazy_db_skip(monkeypatch):
     # Retry with same Idempotency-Key returns same order from Redis without opening DB or double-emitting Kafka
     r2 = client.post(
         "/api/v1/orders",
-        json={"user_id": "test_buyer_1", "product_id": product_id, "quantity": 1},
+        json={"user_id": buyer_id, "product_id": product_id, "quantity": 1},
         headers=headers,
     )
     assert r2.status_code == 201
@@ -192,6 +220,61 @@ def test_order_idempotency_query_and_lazy_db_skip(monkeypatch):
     p_get = client.get(f"/api/v1/products/{product_id}")
     assert p_get.status_code == 200
     assert p_get.json()["data"]["stock"] == 0
+
+
+def test_transactional_outbox_failure_and_replay(monkeypatch):
+    """Verifies failed Kafka deliveries remain FAILED in Outbox and recover via replay endpoint."""
+    prod_resp = client.post(
+        "/api/v1/products",
+        json={"name": f"Outbox Replay Item {uuid.uuid4().hex[:6]}", "price": 75.0, "stock": 2},
+    )
+    assert prod_resp.status_code == 201
+    product_id = prod_resp.json()["data"]["id"]
+    _created_test_product_ids.append(product_id)
+
+    # Simulate temporary Kafka outage
+    monkeypatch.setattr(event_publisher, "publish_order_event", lambda payload, topic=None: False)
+
+    r_order = client.post(
+        "/api/v1/orders",
+        json={"user_id": "outbox_tester", "product_id": product_id, "quantity": 1},
+        headers={"Idempotency-Key": f"idem_{uuid.uuid4().hex}"},
+    )
+    assert r_order.status_code == 201
+    order_id = r_order.json()["data"]["id"]
+
+    db = SessionLocal()
+    try:
+        ob = db.query(OutboxEvent).filter(OutboxEvent.aggregate_id == str(order_id)).first()
+        assert ob is not None
+        assert ob.status == "FAILED"
+        assert ob.attempts == 1
+    finally:
+        db.close()
+
+    m_resp = client.get("/metrics").json()
+    assert m_resp["outbox_pending_or_failed"] >= 1
+
+    # Simulate Kafka recovery and trigger replay
+    replayed_events = []
+    monkeypatch.setattr(
+        event_publisher,
+        "publish_order_event",
+        lambda payload, topic=None: replayed_events.append(payload) or True,
+    )
+    replay_resp = client.post("/api/v1/orders/outbox/replay?limit=50")
+    assert replay_resp.status_code == 200
+    assert replay_resp.json()["data"]["published"] >= 1
+    assert replay_resp.json()["data"]["failed"] == 0
+    assert any(ev["order_id"] == order_id for ev in replayed_events)
+
+    db = SessionLocal()
+    try:
+        ob = db.query(OutboxEvent).filter(OutboxEvent.aggregate_id == str(order_id)).first()
+        assert ob.status == "PUBLISHED"
+        assert ob.attempts == 2
+    finally:
+        db.close()
 
 
 def test_compensatory_rollback_on_db_failure(monkeypatch):

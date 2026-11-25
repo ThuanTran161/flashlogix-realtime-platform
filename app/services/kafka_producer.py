@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 from confluent_kafka import KafkaException, Producer
 from loguru import logger
 from app.core.config import settings
+from app.core.telemetry import telemetry
 
 
 class EventPublisher:
@@ -31,8 +32,10 @@ class EventPublisher:
     @staticmethod
     def _delivery_report(err, msg) -> None:
         if err is not None:
+            telemetry.inc("kafka_publish_failures_total")
             logger.error(f"[KAFKA_DELIVERY_FAILED] Error delivering message: {err}")
         else:
+            telemetry.inc("kafka_events_published_total")
             key = msg.key().decode("utf-8") if msg.key() else "unknown"
             logger.debug(
                 f"[KAFKA_PUBLISHED] order_id={key} topic={msg.topic()} "
@@ -79,14 +82,21 @@ class EventPublisher:
                 value=json.dumps(event_payload).encode("utf-8"),
                 callback=self._delivery_report,
             )
-            # Runs inside FastAPI BackgroundTasks (post-response) so flushing up to 1s
-            # guarantees zero lost events without adding latency to the client HTTP 201.
-            producer.flush(timeout=1.0)
+            # Runs inside FastAPI BackgroundTasks (post-response) so flushing up to 5s
+            # accommodates cold-start idempotent InitProducerId handshakes without
+            # adding latency to the client HTTP 201 response.
+            remaining = producer.flush(timeout=5.0)
+            if remaining > 0:
+                telemetry.inc("kafka_publish_failures_total")
+                logger.error(f"[KAFKA_TIMEOUT] order_id={order_id} remaining={remaining}")
+                return False
             return True
         except (KafkaException, BufferError) as exc:
+            telemetry.inc("kafka_publish_failures_total")
             logger.error(f"[KAFKA_ERROR] order_id={order_id} failed to enqueue event: {exc}")
             return False
         except Exception as exc:
+            telemetry.inc("kafka_publish_failures_total")
             logger.error(f"[KAFKA_UNEXPECTED_ERROR] order_id={order_id} error={exc}")
             return False
 

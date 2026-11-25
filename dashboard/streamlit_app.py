@@ -102,7 +102,7 @@ try:
         st.subheader("📦 Real-Time Inventory (PostgreSQL vs Redis)")
         if not products_df.empty:
             products_df["redis_ram_stock"] = products_df["id"].apply(inventory_service.get_stock)
-            st.dataframe(products_df, use_container_width=True)
+            st.dataframe(products_df, width="stretch")
         else:
             st.info("No products created yet.")
 
@@ -148,7 +148,7 @@ try:
 
     st.subheader("🧾 Recent Confirmed Orders")
     if not orders_df.empty:
-        st.dataframe(orders_df.head(50), use_container_width=True)
+        st.dataframe(orders_df.head(50), width="stretch")
 
 except Exception as exc:
     st.error(f"Unable to connect to FlashLogix databases: {exc}")

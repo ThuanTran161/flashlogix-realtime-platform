@@ -2,17 +2,18 @@
 
 Transforms Lakehouse Bronze/Silver Parquet records from MinIO into the
 PostgreSQL analytical Star Schema (`Dim_Date`, `Dim_Users` with SCD Type 2,
-`Dim_Products`, and `Fact_Flash_Sale_Orders`), enforcing PII masking,
-unified velocity-based fraud flagging, idempotent fact loading, and
-automated Data Quality & Reconciliation auditing.
+`Dim_Products`, and `Fact_Flash_Sale_Orders`), using date-partition pruning
+and set-based batch upserts, enforcing PII masking, unified velocity-based
+fraud flagging, idempotent fact loading, and automated Data Quality auditing.
 """
+import argparse
 import hashlib
 import io
 import json
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import pyarrow as pa
@@ -43,13 +44,25 @@ def infer_membership_tier(total_spent: float) -> str:
     return "Standard"
 
 
-def read_parquet_prefix_from_minio(prefix: str) -> pd.DataFrame:
-    """Reads and concatenates all Parquet objects under a MinIO S3 prefix."""
+def build_partitioned_prefix(prefix: str, target_date: Optional[str] = None) -> str:
+    """Builds an S3 prefix with optional `order_date=YYYY-MM-DD/` partition pruning."""
+    normalized = prefix.rstrip("/") + "/"
+    if target_date:
+        return f"{normalized}order_date={target_date}/"
+    return normalized
+
+
+def read_parquet_prefix_from_minio(
+    prefix: str,
+    target_date: Optional[str] = None,
+) -> pd.DataFrame:
+    """Reads and concatenates Parquet objects under a MinIO S3 prefix (with optional date pruning)."""
     s3 = get_s3_client()
     paginator = s3.get_paginator("list_objects_v2")
+    effective_prefix = build_partitioned_prefix(prefix, target_date=target_date)
     frames: List[pd.DataFrame] = []
 
-    for page in paginator.paginate(Bucket=settings.MINIO_BUCKET, Prefix=prefix):
+    for page in paginator.paginate(Bucket=settings.MINIO_BUCKET, Prefix=effective_prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
             if not key.endswith(".parquet"):
@@ -139,12 +152,7 @@ def upsert_dim_product(
 def upsert_dim_user_scd2(
     conn: Connection, masked_user_id: str, new_tier: str
 ) -> int:
-    """Executes SCD Type 2 Upsert on Dim_Users (Skill 4).
-
-    1. Expires active row (`is_current = FALSE, effective_to = NOW()`) if tier changed.
-    2. Inserts a new active row if no current row matches `(masked_user_id, new_tier)`.
-    3. Returns the active `user_sk` surrogate key.
-    """
+    """Executes SCD Type 2 Upsert on Dim_Users for a single masked user."""
     conn.execute(
         text(
             """
@@ -186,6 +194,151 @@ def upsert_dim_user_scd2(
         {"masked_user_id": masked_user_id},
     ).fetchone()
     return int(row[0])
+
+
+def _batch_upsert_dim_dates(conn: Connection, unique_dts: List[datetime]) -> Dict[int, int]:
+    """Batch-inserts unique Dim_Date rows and returns `{date_key: date_key}`."""
+    date_map: Dict[int, int] = {}
+    params: List[Dict[str, Any]] = []
+    for dt in unique_dts:
+        dk = int(dt.strftime("%Y%m%d"))
+        if dk in date_map:
+            continue
+        date_map[dk] = dk
+        params.append(
+            {
+                "date_key": dk,
+                "full_date": dt.date(),
+                "day_of_week": dt.strftime("%A"),
+                "month": dt.month,
+                "quarter": (dt.month - 1) // 3 + 1,
+                "year": dt.year,
+                "is_weekend": dt.weekday() >= 5,
+            }
+        )
+    if params:
+        conn.execute(
+            text(
+                """
+                INSERT INTO Dim_Date (date_key, full_date, day_of_week, month, quarter, year, is_weekend)
+                VALUES (:date_key, :full_date, :day_of_week, :month, :quarter, :year, :is_weekend)
+                ON CONFLICT (date_key) DO NOTHING
+                """
+            ),
+            params,
+        )
+    return date_map
+
+
+def _batch_upsert_dim_products(
+    conn: Connection,
+    products_needed: Dict[int, Tuple[str, float]],
+) -> Dict[int, int]:
+    """Batch-upserts Dim_Products rows and returns `{product_id: product_sk}`."""
+    existing_rows = conn.execute(
+        text("SELECT product_id, product_sk FROM Dim_Products")
+    ).fetchall()
+    product_sk_map = {int(r[0]): int(r[1]) for r in existing_rows}
+
+    to_insert = [
+        {"pid": pid, "name": name, "cat": "FlashSale", "price": price}
+        for pid, (name, price) in products_needed.items()
+        if pid not in product_sk_map
+    ]
+    if to_insert:
+        conn.execute(
+            text(
+                """
+                INSERT INTO Dim_Products (product_id, product_name, category, base_price)
+                VALUES (:pid, :name, :cat, :price)
+                ON CONFLICT (product_id) DO NOTHING
+                """
+            ),
+            to_insert,
+        )
+        refreshed = conn.execute(
+            text("SELECT product_id, product_sk FROM Dim_Products")
+        ).fetchall()
+        product_sk_map = {int(r[0]): int(r[1]) for r in refreshed}
+    return product_sk_map
+
+
+def _batch_upsert_dim_users_scd2(
+    conn: Connection,
+    user_tiers: Dict[str, str],
+) -> Dict[str, int]:
+    """Executes set-based SCD Type 2 batch upsert on Dim_Users."""
+    if not user_tiers:
+        return {}
+
+    params = [
+        {"masked_user_id": masked_uid, "new_tier": tier}
+        for masked_uid, tier in user_tiers.items()
+    ]
+    conn.execute(
+        text(
+            """
+            UPDATE Dim_Users
+            SET effective_to = NOW(),
+                is_current = FALSE
+            WHERE masked_user_id = :masked_user_id
+              AND is_current = TRUE
+              AND membership_tier != :new_tier
+            """
+        ),
+        params,
+    )
+    conn.execute(
+        text(
+            """
+            INSERT INTO Dim_Users (masked_user_id, membership_tier, effective_from, effective_to, is_current)
+            SELECT CAST(:masked_user_id AS VARCHAR(64)), CAST(:new_tier AS VARCHAR(20)), NOW(), NULL, TRUE
+            WHERE NOT EXISTS (
+                SELECT 1 FROM Dim_Users
+                WHERE masked_user_id = :masked_user_id
+                  AND membership_tier = :new_tier
+                  AND is_current = TRUE
+            )
+            """
+        ),
+        params,
+    )
+
+    rows = conn.execute(
+        text(
+            """
+            SELECT masked_user_id, user_sk
+            FROM Dim_Users
+            WHERE is_current = TRUE
+            ORDER BY user_sk ASC
+            """
+        )
+    ).fetchall()
+    return {str(r[0]): int(r[1]) for r in rows if str(r[0]) in user_tiers}
+
+
+def _batch_upsert_fact_orders(conn: Connection, fact_rows: List[Dict[str, Any]]) -> int:
+    """Batch-upserts Fact_Flash_Sale_Orders using SQLAlchemy executemany."""
+    if not fact_rows:
+        return 0
+    res = conn.execute(
+        text(
+            """
+            INSERT INTO Fact_Flash_Sale_Orders (
+                order_id, user_sk, product_sk, date_key,
+                quantity, total_amount, latency_ms, is_fraudulent, created_at
+            )
+            VALUES (
+                :order_id, :user_sk, :product_sk, :date_key,
+                :quantity, :total_amount, :latency_ms, :is_fraudulent, :created_at
+            )
+            ON CONFLICT (order_id)
+            DO UPDATE SET is_fraudulent = Fact_Flash_Sale_Orders.is_fraudulent OR EXCLUDED.is_fraudulent
+            """
+        ),
+        fact_rows,
+    )
+    return int(res.rowcount or len(fact_rows))
 
 
 def apply_unified_velocity_fraud_flags(
@@ -252,15 +405,14 @@ def compute_pii_compliance(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
-def run_gold_etl() -> Dict[str, Any]:
-    """Runs Gold Lakehouse ETL and emits Data Quality & Reconciliation SLA metrics."""
+def run_gold_etl(target_date: Optional[str] = None) -> Dict[str, Any]:
+    """Runs Gold Lakehouse ETL with optional date-partition pruning & bulk Star Schema upserts."""
     start_ts = time.perf_counter()
     ensure_lakehouse_bucket(settings.MINIO_BUCKET)
 
-    # Prefer Silver Parquet; fall back to Bronze Parquet (and apply PII masking) if Silver is empty
     source_layer = "silver"
-    df = read_parquet_prefix_from_minio("silver/orders/")
-    bronze_df = read_parquet_prefix_from_minio("bronze/orders/")
+    df = read_parquet_prefix_from_minio("silver/orders/", target_date=target_date)
+    bronze_df = read_parquet_prefix_from_minio("bronze/orders/", target_date=target_date)
     if df.empty:
         source_layer = "bronze"
         df = bronze_df
@@ -284,7 +436,6 @@ def run_gold_etl() -> Dict[str, Any]:
     deduplicated_orders = int(len(df))
     duplicates_filtered = max(0, raw_lakehouse_records - deduplicated_orders)
 
-    # Enforce PII Masking if sourced from Bronze
     if "masked_user_id" not in df.columns and "user_id" in df.columns:
         df["masked_user_id"] = df["user_id"].astype(str).apply(mask_pii)
         df.drop(columns=["user_id"], inplace=True)
@@ -296,80 +447,103 @@ def run_gold_etl() -> Dict[str, Any]:
         else deduplicated_orders
     )
 
-    # Normalize timestamp column & apply unified 1-minute velocity + Bronze fraud flags
     ts_col = "order_time" if "order_time" in df.columns else "timestamp"
     df["parsed_ts"] = pd.to_datetime(df[ts_col], utc=True).dt.tz_convert(None)
     df = apply_unified_velocity_fraud_flags(df, bronze_df=bronze_df)
 
-    # Compute cumulative spend per masked_user_id for SCD Type 2 tier classification
+    # Compute cumulative spend & tier per distinct masked_user_id for batch SCD Type 2
     user_spend = df.groupby("masked_user_id")["total_amount"].sum().to_dict()
+    user_tiers = {
+        str(uid): infer_membership_tier(float(spent))
+        for uid, spent in user_spend.items()
+    }
 
     with engine.begin() as conn:
         ensure_star_schema_tables(conn)
         prod_rows = conn.execute(text("SELECT id, name, price FROM products")).fetchall()
         product_catalog = {int(r[0]): (str(r[1]), float(r[2])) for r in prod_rows}
 
-        inserted_facts = 0
+        products_needed: Dict[int, Tuple[str, float]] = {}
+        unique_dts: List[datetime] = []
+        seen_date_keys = set()
+
+        prepared_rows: List[Dict[str, Any]] = []
         for row in df.itertuples(index=False):
-            order_id = int(row.order_id)
             product_id = int(row.product_id)
-            masked_uid = str(row.masked_user_id)
-            qty = int(row.quantity)
-            total_amt = float(getattr(row, "total_amount", 0.0) or 0.0)
-            latency_ms = int(getattr(row, "latency_ms", 0) or 0)
-            is_fraud = bool(getattr(row, "is_fraudulent", False))
             created_dt = row.parsed_ts.to_pydatetime()
-
-            prod_name, base_price = product_catalog.get(
-                product_id,
-                (f"Flash Product #{product_id}", float(getattr(row, "unit_price", 0.0) or 0.0)),
-            )
-            tier = infer_membership_tier(float(user_spend.get(masked_uid, total_amt)))
-
-            date_key = upsert_dim_date(conn, created_dt)
-            product_sk = upsert_dim_product(conn, product_id, prod_name, base_price)
-            user_sk = upsert_dim_user_scd2(conn, masked_uid, tier)
-
-            res = conn.execute(
-                text(
-                    """
-                    INSERT INTO Fact_Flash_Sale_Orders (
-                        order_id, user_sk, product_sk, date_key,
-                        quantity, total_amount, latency_ms, is_fraudulent, created_at
-                    )
-                    VALUES (
-                        :order_id, :user_sk, :product_sk, :date_key,
-                        :quantity, :total_amount, :latency_ms, :is_fraudulent, :created_at
-                    )
-                    ON CONFLICT (order_id)
-                    DO UPDATE SET is_fraudulent = Fact_Flash_Sale_Orders.is_fraudulent OR EXCLUDED.is_fraudulent
-                    """
-                ),
+            dk = int(created_dt.strftime("%Y%m%d"))
+            if dk not in seen_date_keys:
+                seen_date_keys.add(dk)
+                unique_dts.append(created_dt)
+            if product_id not in products_needed:
+                products_needed[product_id] = product_catalog.get(
+                    product_id,
+                    (f"Flash Product #{product_id}", float(getattr(row, "unit_price", 0.0) or 0.0)),
+                )
+            prepared_rows.append(
                 {
-                    "order_id": order_id,
-                    "user_sk": user_sk,
-                    "product_sk": product_sk,
-                    "date_key": date_key,
-                    "quantity": qty,
-                    "total_amount": total_amt,
-                    "latency_ms": latency_ms,
-                    "is_fraudulent": is_fraud,
+                    "order_id": int(row.order_id),
+                    "product_id": product_id,
+                    "masked_uid": str(row.masked_user_id),
+                    "date_key": dk,
+                    "quantity": int(row.quantity),
+                    "total_amount": float(getattr(row, "total_amount", 0.0) or 0.0),
+                    "latency_ms": int(getattr(row, "latency_ms", 0) or 0),
+                    "is_fraudulent": bool(getattr(row, "is_fraudulent", False)),
                     "created_at": created_dt,
-                },
+                }
             )
-            inserted_facts += res.rowcount or 0
 
-        # OLTP-to-Gold Reconciliation Audit
-        oltp_row = conn.execute(
-            text("SELECT COUNT(*), COALESCE(SUM(total_amount), 0) FROM orders")
-        ).fetchone()
-        gold_row = conn.execute(
-            text(
-                "SELECT COUNT(*), COALESCE(SUM(total_amount), 0), "
-                "COALESCE(SUM(CASE WHEN is_fraudulent THEN 1 ELSE 0 END), 0) "
-                "FROM Fact_Flash_Sale_Orders"
-            )
-        ).fetchone()
+        _batch_upsert_dim_dates(conn, unique_dts)
+        product_sk_map = _batch_upsert_dim_products(conn, products_needed)
+        user_sk_map = _batch_upsert_dim_users_scd2(conn, user_tiers)
+
+        fact_rows = [
+            {
+                "order_id": r["order_id"],
+                "user_sk": user_sk_map[r["masked_uid"]],
+                "product_sk": product_sk_map[r["product_id"]],
+                "date_key": r["date_key"],
+                "quantity": r["quantity"],
+                "total_amount": r["total_amount"],
+                "latency_ms": r["latency_ms"],
+                "is_fraudulent": r["is_fraudulent"],
+                "created_at": r["created_at"],
+            }
+            for r in prepared_rows
+        ]
+        inserted_facts = _batch_upsert_fact_orders(conn, fact_rows)
+
+        # OLTP-to-Gold Reconciliation Audit (full or target_date slice)
+        if target_date:
+            target_dt_obj = datetime.strptime(target_date, "%Y-%m-%d").date()
+            target_date_key = int(target_dt_obj.strftime("%Y%m%d"))
+            oltp_row = conn.execute(
+                text(
+                    "SELECT COUNT(*), COALESCE(SUM(total_amount), 0) "
+                    "FROM orders WHERE DATE(created_at) = :td"
+                ),
+                {"td": target_dt_obj},
+            ).fetchone()
+            gold_row = conn.execute(
+                text(
+                    "SELECT COUNT(*), COALESCE(SUM(total_amount), 0), "
+                    "COALESCE(SUM(CASE WHEN is_fraudulent THEN 1 ELSE 0 END), 0) "
+                    "FROM Fact_Flash_Sale_Orders WHERE date_key = :dk"
+                ),
+                {"dk": target_date_key},
+            ).fetchone()
+        else:
+            oltp_row = conn.execute(
+                text("SELECT COUNT(*), COALESCE(SUM(total_amount), 0) FROM orders")
+            ).fetchone()
+            gold_row = conn.execute(
+                text(
+                    "SELECT COUNT(*), COALESCE(SUM(total_amount), 0), "
+                    "COALESCE(SUM(CASE WHEN is_fraudulent THEN 1 ELSE 0 END), 0) "
+                    "FROM Fact_Flash_Sale_Orders"
+                )
+            ).fetchone()
 
     oltp_orders_count = int(oltp_row[0])
     oltp_revenue = round(float(oltp_row[1]), 2)
@@ -385,7 +559,6 @@ def run_gold_etl() -> Dict[str, Any]:
     )
     revenue_delta = round(abs(oltp_revenue - gold_revenue), 2)
 
-    # Materialize Gold summary Parquet snapshot to MinIO
     gold_summary = (
         df.groupby("product_id", as_index=False)
         .agg(
@@ -411,6 +584,7 @@ def run_gold_etl() -> Dict[str, Any]:
     data_quality_report = {
         "generated_at": generated_at,
         "source_layer": source_layer,
+        "target_date": target_date,
         "etl_duration_sec": etl_duration_sec,
         "bronze_raw_records": bronze_raw_records,
         "raw_lakehouse_records": raw_lakehouse_records,
@@ -441,8 +615,8 @@ def run_gold_etl() -> Dict[str, Any]:
     )
 
     logger.info(
-        f"[GOLD_ETL] Completed from '{source_layer}' in {etl_duration_sec}s | "
-        f"raw={raw_lakehouse_records} -> dedup={deduplicated_orders} "
+        f"[GOLD_ETL] Completed from '{source_layer}' (date={target_date or 'ALL'}) "
+        f"in {etl_duration_sec}s | raw={raw_lakehouse_records} -> dedup={deduplicated_orders} "
         f"(filtered_dups={duplicates_filtered}, quarantine_objs={quarantined_objects}) | "
         f"fraud_flagged={fraud_flagged_count} | parity={order_parity_pct}% (delta=${revenue_delta}) | "
         f"pii_violations={pii_audit['pii_violations']}"
@@ -455,4 +629,12 @@ def run_gold_etl() -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    run_gold_etl()
+    parser = argparse.ArgumentParser(description="FlashLogix Gold Star Schema Batch ETL")
+    parser.add_argument(
+        "--date",
+        dest="target_date",
+        default=None,
+        help="Optional UTC partition date (YYYY-MM-DD) for incremental partition pruning.",
+    )
+    args = parser.parse_args()
+    run_gold_etl(target_date=args.target_date)

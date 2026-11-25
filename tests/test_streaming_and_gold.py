@@ -1,4 +1,5 @@
-﻿import hashlib
+﻿from datetime import datetime
+import hashlib
 import json
 import os
 import sys
@@ -13,7 +14,12 @@ from sqlalchemy import text
 
 from app.core.database import engine
 from lakehouse.batch_gold_aggregation import (
+    _batch_upsert_dim_dates,
+    _batch_upsert_dim_products,
+    _batch_upsert_dim_users_scd2,
+    _batch_upsert_fact_orders,
     apply_unified_velocity_fraud_flags,
+    build_partitioned_prefix,
     compute_pii_compliance,
     ensure_star_schema_tables,
     mask_pii,
@@ -33,6 +39,7 @@ def spark():
         SparkSession.builder.master("local[1]")
         .appName("FlashLogix-Unit-Tests")
         .config("spark.ui.enabled", "false")
+        .config("spark.sql.session.timeZone", "UTC")
         .getOrCreate()
     )
     yield session
@@ -106,6 +113,7 @@ def test_pyspark_pii_masking_dedup_and_quarantine(spark):
     expected_alice_hash = hashlib.sha256(f"alice_secret_id{salt}".encode("utf-8")).hexdigest()
     alice_row = [r for r in rows if r["order_id"] == 101][0]
     assert alice_row["masked_user_id"] == expected_alice_hash
+    assert str(alice_row["order_date"]) == "2026-11-25"
 
     # Verify 1-minute tumbling window aggregation
     win_rows = compute_windowed_sales(silver_df).collect()
@@ -208,3 +216,63 @@ def test_scd_type_2_dim_users_upsert():
     finally:
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM Dim_Users WHERE masked_user_id = :mid"), {"mid": test_masked_id})
+
+
+def test_gold_partition_pruning_and_batch_upserts():
+    """Tests date-partition pruning helper and set-based batch Gold Star Schema upserts."""
+    assert build_partitioned_prefix("silver/orders/") == "silver/orders/"
+    assert (
+        build_partitioned_prefix("silver/orders/", "2026-11-26")
+        == "silver/orders/order_date=2026-11-26/"
+    )
+
+    test_masked = mask_pii(f"batch_user_{uuid.uuid4().hex}")
+    test_pid = 998877
+    test_order_id = 99887701
+    dt = datetime(2026, 11, 26, 1, 0, 0)
+
+    try:
+        with engine.begin() as conn:
+            ensure_star_schema_tables(conn)
+            date_map = _batch_upsert_dim_dates(conn, [dt])
+            prod_map = _batch_upsert_dim_products(conn, {test_pid: ("Batch Test Item", 42.0)})
+            user_map = _batch_upsert_dim_users_scd2(conn, {test_masked: "VIP"})
+
+            assert 20261126 in date_map
+            assert test_pid in prod_map
+            assert test_masked in user_map
+
+            inserted = _batch_upsert_fact_orders(
+                conn,
+                [
+                    {
+                        "order_id": test_order_id,
+                        "user_sk": user_map[test_masked],
+                        "product_sk": prod_map[test_pid],
+                        "date_key": 20261126,
+                        "quantity": 2,
+                        "total_amount": 84.0,
+                        "latency_ms": 15,
+                        "is_fraudulent": True,
+                        "created_at": dt,
+                    }
+                ],
+            )
+            assert inserted == 1
+
+            row = conn.execute(
+                text(
+                    "SELECT quantity, total_amount, is_fraudulent "
+                    "FROM Fact_Flash_Sale_Orders WHERE order_id = :oid"
+                ),
+                {"oid": test_order_id},
+            ).fetchone()
+            assert row is not None
+            assert int(row[0]) == 2
+            assert float(row[1]) == 84.0
+            assert bool(row[2]) is True
+    finally:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM Fact_Flash_Sale_Orders WHERE order_id = :oid"), {"oid": test_order_id})
+            conn.execute(text("DELETE FROM Dim_Products WHERE product_id = :pid"), {"pid": test_pid})
+            conn.execute(text("DELETE FROM Dim_Users WHERE masked_user_id = :mid"), {"mid": test_masked})
