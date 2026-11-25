@@ -1,5 +1,5 @@
-from functools import lru_cache
-from typing import Optional
+﻿from functools import lru_cache
+from typing import Literal, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,8 +14,14 @@ class Settings(BaseSettings):
     APP_NAME: str = "FlashLogix"
     APP_ENV: str = "development"
     DEBUG: bool = False
+    LOG_LEVEL: str = "INFO"
     HOST: str = "0.0.0.0"
     PORT: int = 8000
+
+    # Concurrency Strategy:
+    # - "redis_async_lazy": Async Redis Gate + Idempotency/Product Cache + Lazy DB session (Default)
+    # - "db_only": Pure PostgreSQL SELECT ... FOR UPDATE (for controlled baseline benchmarking)
+    CONCURRENCY_MODE: Literal["redis_async_lazy", "db_only"] = "redis_async_lazy"
 
     # --- PostgreSQL OLTP ---
     POSTGRES_USER: str = "postgres"
@@ -36,7 +42,9 @@ class Settings(BaseSettings):
     REDIS_PORT: int = 6380
     REDIS_DB: int = 0
     REDIS_PASSWORD: Optional[str] = None
-    REDIS_MAX_CONNECTIONS: int = 50
+    REDIS_MAX_CONNECTIONS: int = 100
+    PRODUCT_CACHE_TTL_SEC: int = 300
+    IDEMPOTENCY_TTL_SEC: int = 86400
 
     # --- Apache Kafka ---
     KAFKA_BOOTSTRAP_SERVERS: str = "localhost:9094"

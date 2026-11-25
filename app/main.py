@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import sys
 from typing import AsyncGenerator
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
@@ -12,14 +13,25 @@ from app.api.v1.router import api_v1_router
 from app.core.config import settings
 from app.core.database import Base, engine
 from app.core.storage import ensure_lakehouse_bucket
-from app.services.inventory_service import redis_client
+from app.services.inventory_service import inventory_service, redis_client
 from app.services.kafka_producer import event_publisher
+
+
+def _configure_logging() -> None:
+    logger.remove()
+    logger.add(sys.stderr, level=settings.LOG_LEVEL.upper())
+
+
+_configure_logging()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manages application startup and graceful shutdown lifecycle."""
-    logger.info("Initializing FlashLogix Transaction Engine...")
+    logger.info(
+        f"Initializing FlashLogix Transaction Engine (mode={settings.CONCURRENCY_MODE}, "
+        f"log_level={settings.LOG_LEVEL})..."
+    )
 
     try:
         Base.metadata.create_all(bind=engine)
@@ -42,13 +54,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     logger.info("Shutting down FlashLogix Transaction Engine...")
     event_publisher.flush(timeout=5.0)
+    await inventory_service.close_async()
     redis_client.close()
 
 
 app = FastAPI(
     title=settings.APP_NAME,
     description="High-Concurrency Flash Sale Transaction Engine & Real-time Event Analytics Platform",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -121,6 +134,7 @@ async def health_check():
         "status": "UP",
         "app": settings.APP_NAME,
         "environment": settings.APP_ENV,
+        "concurrency_mode": settings.CONCURRENCY_MODE,
         "services": services,
     }
 

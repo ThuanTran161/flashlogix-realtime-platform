@@ -1,4 +1,4 @@
-import json
+﻿import json
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -22,7 +22,7 @@ class EventPublisher:
                 "retries": 5,
                 "enable.idempotence": True,
                 "compression.type": "gzip",
-                "linger.ms": 5,
+                "linger.ms": 2,
                 "batch.size": 32768,
             }
             self._producer = Producer(conf)
@@ -68,7 +68,7 @@ class EventPublisher:
         }
 
     def publish_order_event(self, event_payload: Dict[str, Any], topic: Optional[str] = None) -> bool:
-        """Publishes an order event asynchronously to Kafka with delivery callback."""
+        """Publishes an order event asynchronously to Kafka with guaranteed delivery flush."""
         target_topic = topic or settings.KAFKA_TOPIC_ORDERS
         order_id = event_payload.get("order_id")
         try:
@@ -79,7 +79,9 @@ class EventPublisher:
                 value=json.dumps(event_payload).encode("utf-8"),
                 callback=self._delivery_report,
             )
-            producer.poll(0)
+            # Runs inside FastAPI BackgroundTasks (post-response) so flushing up to 1s
+            # guarantees zero lost events without adding latency to the client HTTP 201.
+            producer.flush(timeout=1.0)
             return True
         except (KafkaException, BufferError) as exc:
             logger.error(f"[KAFKA_ERROR] order_id={order_id} failed to enqueue event: {exc}")

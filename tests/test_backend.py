@@ -1,21 +1,30 @@
+﻿import sys
 import uuid
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from app.core.config import settings
-from app.core.database import Base, SessionLocal, engine
+from app.core.database import Base, engine
 from app.main import app
-from app.models.order import Order
-from app.models.product import Product
-from app.services.inventory_service import inventory_service, redis_client
 from app.schemas.order import OrderCreate
 from app.schemas.product import ProductCreate
+from app.services.inventory_service import inventory_service, redis_client
+from app.services.kafka_producer import event_publisher
+
+_created_test_product_ids = []
+
 
 @pytest.fixture(scope="module", autouse=True)
 def setup_test_db():
     Base.metadata.create_all(bind=engine)
     yield
+    if _created_test_product_ids:
+        with engine.begin() as conn:
+            for pid in _created_test_product_ids:
+                conn.execute(text("DELETE FROM orders WHERE product_id = :pid"), {"pid": pid})
+                conn.execute(text("DELETE FROM products WHERE id = :pid"), {"pid": pid})
+                redis_client.delete(f"stock:product:{pid}", f"product:meta:{pid}")
 
 
 client = TestClient(app)
@@ -25,6 +34,7 @@ def test_settings_load():
     """Verifies environment settings are loaded and typed correctly."""
     assert settings.APP_NAME == "FlashLogix"
     assert settings.PORT == 8000
+    assert settings.CONCURRENCY_MODE == "redis_async_lazy"
     assert "postgresql://" in settings.get_database_url()
 
 
@@ -89,14 +99,22 @@ def test_redis_atomic_lua_decrement_and_rollback():
     redis_client.delete(f"stock:product:{test_pid}")
 
 
-def test_order_idempotency_and_zero_overselling_flow():
-    """Integration test: Create product -> Idempotent order -> Oversell prevention."""
+def test_order_idempotency_and_zero_overselling_flow(monkeypatch):
+    """Integration test: Create product -> Idempotent order -> Oversell prevention -> Lazy DB skip."""
+    published_events = []
+    monkeypatch.setattr(
+        event_publisher,
+        "publish_order_event",
+        lambda payload, topic=None: published_events.append(payload) or True,
+    )
+
     prod_resp = client.post(
         "/api/v1/products",
         json={"name": f"Test Flash Item {uuid.uuid4().hex[:6]}", "price": 99.5, "stock": 1},
     )
     assert prod_resp.status_code == 201
     product_id = prod_resp.json()["data"]["id"]
+    _created_test_product_ids.append(product_id)
 
     idem_key = f"idem_{uuid.uuid4().hex}"
     headers = {"Idempotency-Key": idem_key}
@@ -110,8 +128,19 @@ def test_order_idempotency_and_zero_overselling_flow():
     assert r1.status_code == 201
     order_id_1 = r1.json()["data"]["id"]
     assert r1.json()["data"]["total_amount"] == 99.5
+    assert len(published_events) == 1
 
-    # Retry with same Idempotency-Key returns same order without deducting stock again
+    # Patch SessionLocal on the actual modules to prove retries & rejections NEVER touch PostgreSQL
+    order_service_mod = sys.modules["app.services.order_service"]
+    products_api_mod = sys.modules["app.api.v1.products"]
+
+    def fail_if_db_opened():
+        raise AssertionError("PostgreSQL SessionLocal should NOT be acquired on cache hit/rejection!")
+
+    monkeypatch.setattr(order_service_mod, "SessionLocal", fail_if_db_opened)
+    monkeypatch.setattr(products_api_mod, "SessionLocal", fail_if_db_opened)
+
+    # Retry with same Idempotency-Key returns same order from Redis without opening DB or double-emitting Kafka
     r2 = client.post(
         "/api/v1/orders",
         json={"user_id": "test_buyer_1", "product_id": product_id, "quantity": 1},
@@ -119,8 +148,9 @@ def test_order_idempotency_and_zero_overselling_flow():
     )
     assert r2.status_code == 201
     assert r2.json()["data"]["id"] == order_id_1
+    assert len(published_events) == 1
 
-    # Second distinct buyer fails with INSUFFICIENT_STOCK (standard error envelope)
+    # Second distinct buyer fails with INSUFFICIENT_STOCK in Redis without touching DB
     r3 = client.post(
         "/api/v1/orders",
         json={"user_id": "test_buyer_2", "product_id": product_id, "quantity": 1},
@@ -129,6 +159,11 @@ def test_order_idempotency_and_zero_overselling_flow():
     assert r3.status_code == 400
     assert r3.json()["error_code"] == "INSUFFICIENT_STOCK"
     assert inventory_service.get_stock(product_id) == 0
+
+    # Product read hits Redis Read-Through Cache with updated RAM stock=0 and zero DB queries
+    p_get = client.get(f"/api/v1/products/{product_id}")
+    assert p_get.status_code == 200
+    assert p_get.json()["data"]["stock"] == 0
 
 
 def test_compensatory_rollback_on_db_failure(monkeypatch):
@@ -139,6 +174,7 @@ def test_compensatory_rollback_on_db_failure(monkeypatch):
     )
     assert prod_resp.status_code == 201
     product_id = prod_resp.json()["data"]["id"]
+    _created_test_product_ids.append(product_id)
 
     from sqlalchemy.orm import Session
 

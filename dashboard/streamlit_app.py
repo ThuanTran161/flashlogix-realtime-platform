@@ -1,4 +1,5 @@
-"""FlashLogix Real-Time OLTP & Lakehouse Analytics Dashboard."""
+﻿"""FlashLogix Real-Time OLTP & Lakehouse Analytics Dashboard."""
+import json
 import pandas as pd
 import streamlit as st
 from sqlalchemy import text
@@ -45,7 +46,11 @@ def load_oltp_metrics():
 def load_gold_metrics():
     with engine.connect() as conn:
         fact_count = conn.execute(
-            text("SELECT COUNT(*), COALESCE(SUM(total_amount), 0), COALESCE(SUM(CASE WHEN is_fraudulent THEN 1 ELSE 0 END), 0) FROM Fact_Flash_Sale_Orders")
+            text(
+                "SELECT COUNT(*), COALESCE(SUM(total_amount), 0), "
+                "COALESCE(SUM(CASE WHEN is_fraudulent THEN 1 ELSE 0 END), 0) "
+                "FROM Fact_Flash_Sale_Orders"
+            )
         ).fetchone()
         tiers_df = pd.read_sql(
             text(
@@ -55,6 +60,15 @@ def load_gold_metrics():
             conn,
         )
     return fact_count, tiers_df
+
+
+def load_data_quality_report():
+    s3 = get_s3_client()
+    resp = s3.get_object(
+        Bucket=settings.MINIO_BUCKET,
+        Key="gold/data_quality_report/latest.json",
+    )
+    return json.loads(resp["Body"].read().decode("utf-8"))
 
 
 def count_lakehouse_objects():
@@ -115,6 +129,21 @@ try:
             st.bar_chart(tiers_df.set_index("membership_tier"))
     except Exception as exc:
         st.info(f"Gold Star Schema awaiting initial ETL run ({exc}).")
+
+    st.divider()
+    st.subheader("🛡️ Data Quality & Lakehouse Reconciliation SLA")
+    try:
+        dq = load_data_quality_report()
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("OLTP ↔ Gold Parity", f"{dq.get('order_parity_pct', 0):.2f}%")
+        d2.metric("Revenue Delta", f"${dq.get('revenue_delta', 0):.2f}")
+        d3.metric("Duplicates Filtered", f"{dq.get('duplicates_filtered', 0):,}")
+        d4.metric(
+            "PII Compliance",
+            "PASS (0 violations)" if dq.get("pii_compliance_passed") else "FAIL",
+        )
+    except Exception:
+        st.info("Run `python -m lakehouse.batch_gold_aggregation` to generate Data Quality SLA metrics.")
 
     st.subheader("🧾 Recent Confirmed Orders")
     if not orders_df.empty:

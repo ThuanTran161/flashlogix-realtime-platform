@@ -1,14 +1,17 @@
-"""Gold Layer Batch Aggregation & Kimball Star Schema ETL.
+﻿"""Gold Layer Batch Aggregation & Kimball Star Schema ETL.
 
 Transforms Lakehouse Bronze/Silver Parquet records from MinIO into the
 PostgreSQL analytical Star Schema (`Dim_Date`, `Dim_Users` with SCD Type 2,
-`Dim_Products`, and `Fact_Flash_Sale_Orders`), enforcing PII masking and
-idempotent fact loading.
+`Dim_Products`, and `Fact_Flash_Sale_Orders`), enforcing PII masking,
+idempotent fact loading, and automated Data Quality & Reconciliation auditing.
 """
 import hashlib
 import io
+import json
+import re
+import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import pyarrow as pa
@@ -20,6 +23,8 @@ from sqlalchemy.engine import Connection
 from app.core.config import settings
 from app.core.database import engine
 from app.core.storage import ensure_lakehouse_bucket, get_s3_client
+
+SHA256_HEX_RE = re.compile(r"^[a-f0-9]{64}$")
 
 
 def mask_pii(raw_user_id: str, salt: Optional[str] = None) -> str:
@@ -169,25 +174,57 @@ def upsert_dim_user_scd2(
     return int(row[0])
 
 
-def run_gold_etl() -> Dict[str, int]:
-    """Runs the Gold Lakehouse ETL from MinIO Silver/Bronze (with OLTP fallback) into Star Schema."""
+def compute_pii_compliance(df: pd.DataFrame) -> Dict[str, Any]:
+    """Verifies zero raw PII exposure and strict 64-hex SHA-256 masking compliance."""
+    raw_pii_column_present = "user_id" in df.columns
+    invalid_hashes = 0
+    if "masked_user_id" in df.columns:
+        invalid_hashes = int(
+            (~df["masked_user_id"].astype(str).str.match(SHA256_HEX_RE)).sum()
+        )
+    else:
+        invalid_hashes = len(df)
+
+    violations = invalid_hashes + (len(df) if raw_pii_column_present else 0)
+    return {
+        "raw_pii_column_present": raw_pii_column_present,
+        "invalid_hash_count": invalid_hashes,
+        "pii_violations": violations,
+        "pii_compliance_passed": violations == 0,
+    }
+
+
+def run_gold_etl() -> Dict[str, Any]:
+    """Runs Gold Lakehouse ETL and emits Data Quality & Reconciliation SLA metrics."""
+    start_ts = time.perf_counter()
     ensure_lakehouse_bucket(settings.MINIO_BUCKET)
 
     # Prefer Silver Parquet; fall back to Bronze Parquet (and apply PII masking) if Silver is empty
     source_layer = "silver"
     df = read_parquet_prefix_from_minio("silver/orders/")
+    bronze_df = read_parquet_prefix_from_minio("bronze/orders/")
     if df.empty:
         source_layer = "bronze"
-        df = read_parquet_prefix_from_minio("bronze/orders/")
+        df = bronze_df
 
     if df.empty:
         logger.info("[GOLD_ETL] No Parquet events found in MinIO Silver or Bronze layers yet.")
-        return {"processed_orders": 0, "inserted_facts": 0}
+        return {"processed_orders": 0, "inserted_facts": 0, "data_quality": {}}
+
+    source_raw_records = int(len(df))
+    bronze_raw_records = int(len(bronze_df)) if not bronze_df.empty else source_raw_records
+    raw_lakehouse_records = max(source_raw_records, bronze_raw_records)
+
+    null_order_ids = int(df["order_id"].isna().sum()) if "order_id" in df.columns else source_raw_records
+    df = df.dropna(subset=["order_id"]).copy()
 
     ts_sort_col = "order_time" if "order_time" in df.columns else "timestamp"
     if ts_sort_col in df.columns:
         df = df.sort_values(ts_sort_col)
     df = df.drop_duplicates(subset=["order_id"], keep="last").copy()
+
+    deduplicated_orders = int(len(df))
+    duplicates_filtered = max(0, raw_lakehouse_records - deduplicated_orders)
 
     # Enforce PII Masking if sourced from Bronze
     if "masked_user_id" not in df.columns and "user_id" in df.columns:
@@ -197,6 +234,13 @@ def run_gold_etl() -> Dict[str, int]:
     if "is_fraudulent" not in df.columns:
         df["is_fraudulent"] = False
 
+    pii_audit = compute_pii_compliance(df)
+    invalid_amount_count = (
+        int((df["total_amount"].fillna(-1) <= 0).sum())
+        if "total_amount" in df.columns
+        else deduplicated_orders
+    )
+
     # Normalize timestamp column
     ts_col = "order_time" if "order_time" in df.columns else "timestamp"
     df["parsed_ts"] = pd.to_datetime(df[ts_col], utc=True).dt.tz_convert(None)
@@ -204,7 +248,6 @@ def run_gold_etl() -> Dict[str, int]:
     # Compute cumulative spend per masked_user_id for SCD Type 2 tier classification
     user_spend = df.groupby("masked_user_id")["total_amount"].sum().to_dict()
 
-    # Load product catalog metadata from OLTP for Dim_Products enrichment
     with engine.begin() as conn:
         ensure_star_schema_tables(conn)
         prod_rows = conn.execute(text("SELECT id, name, price FROM products")).fetchall()
@@ -222,7 +265,8 @@ def run_gold_etl() -> Dict[str, int]:
             created_dt = row.parsed_ts.to_pydatetime()
 
             prod_name, base_price = product_catalog.get(
-                product_id, (f"Flash Product #{product_id}", float(getattr(row, "unit_price", 0.0) or 0.0))
+                product_id,
+                (f"Flash Product #{product_id}", float(getattr(row, "unit_price", 0.0) or 0.0)),
             )
             tier = infer_membership_tier(float(user_spend.get(masked_uid, total_amt)))
 
@@ -258,7 +302,32 @@ def run_gold_etl() -> Dict[str, int]:
             )
             inserted_facts += res.rowcount or 0
 
-    # Also materialize Gold summary Parquet snapshot to MinIO
+        # OLTP-to-Gold Reconciliation Audit
+        oltp_row = conn.execute(
+            text("SELECT COUNT(*), COALESCE(SUM(total_amount), 0) FROM orders")
+        ).fetchone()
+        gold_row = conn.execute(
+            text(
+                "SELECT COUNT(*), COALESCE(SUM(total_amount), 0), "
+                "COALESCE(SUM(CASE WHEN is_fraudulent THEN 1 ELSE 0 END), 0) "
+                "FROM Fact_Flash_Sale_Orders"
+            )
+        ).fetchone()
+
+    oltp_orders_count = int(oltp_row[0])
+    oltp_revenue = round(float(oltp_row[1]), 2)
+    gold_fact_count = int(gold_row[0])
+    gold_revenue = round(float(gold_row[1]), 2)
+    fraud_flagged_count = int(gold_row[2])
+
+    order_parity_pct = (
+        round((gold_fact_count / oltp_orders_count) * 100.0, 2)
+        if oltp_orders_count > 0
+        else 100.0
+    )
+    revenue_delta = round(abs(oltp_revenue - gold_revenue), 2)
+
+    # Materialize Gold summary Parquet snapshot to MinIO
     gold_summary = (
         df.groupby("product_id", as_index=False)
         .agg(
@@ -268,21 +337,62 @@ def run_gold_etl() -> Dict[str, int]:
             avg_latency_ms=("latency_ms", "mean"),
         )
     )
-    gold_summary["generated_at"] = datetime.now(timezone.utc).isoformat()
+    generated_at = datetime.now(timezone.utc).isoformat()
+    gold_summary["generated_at"] = generated_at
     buf = io.BytesIO()
     pq.write_table(pa.Table.from_pandas(gold_summary), buf, compression="snappy")
     buf.seek(0)
-    get_s3_client().put_object(
+    s3 = get_s3_client()
+    s3.put_object(
         Bucket=settings.MINIO_BUCKET,
         Key="gold/daily_product_revenue/latest.parquet",
         Body=buf.getvalue(),
     )
 
-    logger.info(
-        f"[GOLD_ETL] Completed from '{source_layer}' layer. "
-        f"processed_orders={len(df)}, newly_inserted_facts={inserted_facts}"
+    etl_duration_sec = round(time.perf_counter() - start_ts, 3)
+    data_quality_report = {
+        "generated_at": generated_at,
+        "source_layer": source_layer,
+        "etl_duration_sec": etl_duration_sec,
+        "bronze_raw_records": bronze_raw_records,
+        "raw_lakehouse_records": raw_lakehouse_records,
+        "deduplicated_orders": deduplicated_orders,
+        "duplicates_filtered": duplicates_filtered,
+        "dedup_filter_rate_pct": (
+            round((duplicates_filtered / raw_lakehouse_records) * 100.0, 2)
+            if raw_lakehouse_records > 0
+            else 0.0
+        ),
+        "null_order_id_count": null_order_ids,
+        "invalid_amount_count": invalid_amount_count,
+        **pii_audit,
+        "oltp_orders_count": oltp_orders_count,
+        "gold_fact_count": gold_fact_count,
+        "oltp_revenue": oltp_revenue,
+        "gold_revenue": gold_revenue,
+        "order_parity_pct": order_parity_pct,
+        "revenue_delta": revenue_delta,
+        "fraud_flagged_count": fraud_flagged_count,
+    }
+    s3.put_object(
+        Bucket=settings.MINIO_BUCKET,
+        Key="gold/data_quality_report/latest.json",
+        Body=json.dumps(data_quality_report, indent=2).encode("utf-8"),
+        ContentType="application/json",
     )
-    return {"processed_orders": len(df), "inserted_facts": inserted_facts}
+
+    logger.info(
+        f"[GOLD_ETL] Completed from '{source_layer}' in {etl_duration_sec}s | "
+        f"raw={raw_lakehouse_records} -> dedup={deduplicated_orders} "
+        f"(filtered_dups={duplicates_filtered}) | inserted_facts={inserted_facts} | "
+        f"parity={order_parity_pct}% (delta=${revenue_delta}) | "
+        f"pii_violations={pii_audit['pii_violations']}"
+    )
+    return {
+        "processed_orders": deduplicated_orders,
+        "inserted_facts": inserted_facts,
+        "data_quality": data_quality_report,
+    }
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-import hashlib
+﻿import hashlib
 import os
 import sys
 
@@ -6,12 +6,14 @@ os.environ["PYSPARK_PYTHON"] = sys.executable
 os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 import json
 import uuid
+import pandas as pd
 import pytest
 from pyspark.sql import SparkSession
 from sqlalchemy import text
 
 from app.core.database import engine
 from lakehouse.batch_gold_aggregation import (
+    compute_pii_compliance,
     ensure_star_schema_tables,
     mask_pii,
     upsert_dim_user_scd2,
@@ -103,6 +105,19 @@ def test_pyspark_pii_masking_and_deduplication(spark):
     assert win_rows[0]["order_count"] == 2
     assert win_rows[0]["total_units"] == 3
     assert win_rows[0]["window_revenue"] == 150.0
+
+
+def test_pii_compliance_audit_check():
+    """Verifies Gold ETL Data Quality check flags raw PII and validates SHA-256 hex format."""
+    compliant_df = pd.DataFrame([{"order_id": 1, "masked_user_id": mask_pii("u1")}])
+    res_ok = compute_pii_compliance(compliant_df)
+    assert res_ok["pii_compliance_passed"] is True
+    assert res_ok["pii_violations"] == 0
+
+    non_compliant_df = pd.DataFrame([{"order_id": 1, "user_id": "u1", "masked_user_id": "bad_hash"}])
+    res_fail = compute_pii_compliance(non_compliant_df)
+    assert res_fail["pii_compliance_passed"] is False
+    assert res_fail["pii_violations"] > 0
 
 
 def test_scd_type_2_dim_users_upsert():

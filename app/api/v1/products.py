@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
-from app.core.database import get_db
+from app.core.config import settings
+from app.core.database import SessionLocal, get_db
 from app.models.product import Product
 from app.schemas.common import StandardResponse
 from app.schemas.product import ProductCreate, ProductResponse, ProductStockInit
@@ -10,7 +11,7 @@ from app.services.inventory_service import inventory_service
 router = APIRouter(prefix="/products", tags=["Products"])
 
 
-def _create_product_sync(payload: ProductCreate, db: Session) -> Product:
+def _create_product_sync(payload: ProductCreate, db: Session) -> ProductResponse:
     product = Product(
         name=payload.name,
         price=payload.price,
@@ -19,24 +20,34 @@ def _create_product_sync(payload: ProductCreate, db: Session) -> Product:
     db.add(product)
     db.commit()
     db.refresh(product)
+    resp = ProductResponse.model_validate(product)
     inventory_service.initialize_stock(product.id, payload.stock)
-    return product
+    inventory_service.set_product_meta(product.id, resp.model_dump(mode="json"))
+    return resp
 
 
-def _get_product_sync(product_id: int, db: Session) -> Product:
-    product = db.query(Product).filter(Product.id == product_id).first()
-    if not product:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "detail": f"Product {product_id} not found.",
-                "error_code": "PRODUCT_NOT_FOUND",
-            },
-        )
-    cached_stock = inventory_service.get_stock(product.id)
-    if cached_stock is not None:
-        product.stock = cached_stock
-    return product
+def _get_product_sync(product_id: int) -> ProductResponse:
+    db: Session = SessionLocal()
+    try:
+        product = db.query(Product).filter(Product.id == product_id).first()
+        if not product:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "detail": f"Product {product_id} not found.",
+                    "error_code": "PRODUCT_NOT_FOUND",
+                },
+            )
+        if settings.CONCURRENCY_MODE != "db_only":
+            cached_stock = inventory_service.get_stock(product.id)
+            if cached_stock is not None:
+                product.stock = cached_stock
+        resp = ProductResponse.model_validate(product)
+        if settings.CONCURRENCY_MODE != "db_only":
+            inventory_service.set_product_meta(product.id, resp.model_dump(mode="json"))
+        return resp
+    finally:
+        db.close()
 
 
 def _init_stock_sync(product_id: int, initial_stock: int, db: Session) -> dict:
@@ -51,7 +62,10 @@ def _init_stock_sync(product_id: int, initial_stock: int, db: Session) -> dict:
         )
     product.stock = initial_stock
     db.commit()
+    db.refresh(product)
+    resp = ProductResponse.model_validate(product)
     inventory_service.initialize_stock(product.id, initial_stock)
+    inventory_service.set_product_meta(product.id, resp.model_dump(mode="json"))
     return {"product_id": product_id, "stock": initial_stock}
 
 
@@ -62,25 +76,38 @@ def _init_stock_sync(product_id: int, initial_stock: int, db: Session) -> dict:
     summary="Create Product",
 )
 async def create_product(payload: ProductCreate, db: Session = Depends(get_db)):
-    product = await run_in_threadpool(_create_product_sync, payload, db)
+    product_resp = await run_in_threadpool(_create_product_sync, payload, db)
     return StandardResponse(
         success=True,
-        message=f"Product '{product.name}' created and stock synchronized to Redis.",
-        data=ProductResponse.model_validate(product),
+        message=f"Product '{product_resp.name}' created and stock synchronized to Redis.",
+        data=product_resp,
     )
 
 
 @router.get(
     "/{product_id}",
     response_model=StandardResponse[ProductResponse],
-    summary="Get Product with Cache Stock",
+    summary="Get Product with Redis Read-Through Cache",
 )
-async def get_product(product_id: int, db: Session = Depends(get_db)):
-    product = await run_in_threadpool(_get_product_sync, product_id, db)
+async def get_product(product_id: int):
+    if settings.CONCURRENCY_MODE != "db_only":
+        meta, cached_stock = await inventory_service.get_product_meta_and_stock_async(
+            product_id
+        )
+        if meta is not None:
+            if cached_stock is not None:
+                meta["stock"] = cached_stock
+            return StandardResponse(
+                success=True,
+                message="Product retrieved from Redis cache.",
+                data=ProductResponse(**meta),
+            )
+
+    product_resp = await run_in_threadpool(_get_product_sync, product_id)
     return StandardResponse(
         success=True,
         message="Product retrieved successfully.",
-        data=ProductResponse.model_validate(product),
+        data=product_resp,
     )
 
 

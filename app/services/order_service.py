@@ -1,72 +1,50 @@
+﻿import asyncio
 import time
 from typing import Any, Dict, Optional, Tuple
 from fastapi import HTTPException, status
+from fastapi.concurrency import run_in_threadpool
 from loguru import logger
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from app.core.config import settings
+from app.core.database import SessionLocal
 from app.models.order import Order
 from app.models.product import Product
-from app.schemas.order import OrderCreate
+from app.schemas.order import OrderCreate, OrderResponse
 from app.services.inventory_service import inventory_service
 from app.services.kafka_producer import EventPublisher
 
 
 class OrderService:
-    """Orchestrates order transactions, concurrency safety, and compensatory rollbacks."""
+    """Orchestrates order transactions, async Redis concurrency gates, and rollbacks."""
 
     @staticmethod
-    def process_order(
+    def _persist_order_sync(
         payload: OrderCreate,
-        db: Session,
-        idempotency_key: Optional[str] = None,
-    ) -> Tuple[Order, Optional[Dict[str, Any]]]:
-        """Processes an order with zero-overselling guarantee and idempotency enforcement.
-
-        Returns:
-            (Order, Optional[event_payload]): event_payload is None on idempotent replay.
-        """
-        start_ts = time.perf_counter()
-
-        # Step 1: Idempotency check
-        if idempotency_key:
-            existing_order = (
-                db.query(Order)
-                .filter(Order.idempotency_key == idempotency_key)
-                .first()
-            )
-            if existing_order:
-                logger.info(
-                    f"[IDEMPOTENT_RETRY] order_id={existing_order.id} "
-                    f"idempotency_key='{idempotency_key}'"
-                )
-                return existing_order, None
-
+        idempotency_key: Optional[str],
+        remaining_stock: int,
+        start_ts: float,
+    ) -> Tuple[OrderResponse, Optional[Dict[str, Any]]]:
+        """Lazily acquires a PostgreSQL session ONLY after Redis Lua approves the order."""
+        db: Session = SessionLocal()
         product_id = payload.product_id
         quantity = payload.quantity
-
-        # Step 2: Atomic decrement on Redis RAM (< 2ms)
-        is_deducted, remaining_stock = inventory_service.deduct_stock_atomic(
-            product_id, quantity
-        )
-        if not is_deducted:
-            if remaining_stock == -1:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail={
-                        "detail": "Flash sale item is sold out or has insufficient quantity.",
-                        "error_code": "INSUFFICIENT_STOCK",
-                    },
-                )
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "detail": f"Product {product_id} is not initialized for flash sale in cache.",
-                    "error_code": "PRODUCT_NOT_INITIALIZED",
-                },
-            )
-
-        # Step 3: Persist in PostgreSQL OLTP within a guarded transaction
         try:
+            if idempotency_key:
+                existing_order = (
+                    db.query(Order)
+                    .filter(Order.idempotency_key == idempotency_key)
+                    .first()
+                )
+                if existing_order:
+                    # Restore the stock unit deducted before discovering DB idempotency hit
+                    inventory_service.compensatory_increment(product_id, quantity)
+                    logger.info(
+                        f"[IDEMPOTENT_RETRY_DB] order_id={existing_order.id} "
+                        f"idempotency_key='{idempotency_key}'"
+                    )
+                    return OrderResponse.model_validate(existing_order), None
+
             db_product = (
                 db.query(Product)
                 .filter(Product.id == product_id)
@@ -116,7 +94,7 @@ class OrderService:
                 f"product_id={product_id} qty={quantity} total={total_amount} "
                 f"latency_ms={elapsed_ms} remaining_ram={remaining_stock}"
             )
-            return new_order, event_payload
+            return OrderResponse.model_validate(new_order), event_payload
 
         except IntegrityError as ie:
             db.rollback()
@@ -140,6 +118,283 @@ class OrderService:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail={
                     "detail": "Database transaction failed. Inventory has been safely restored.",
+                    "error_code": "DATABASE_ERROR",
+                },
+            )
+        finally:
+            db.close()
+
+    @staticmethod
+    def _process_order_db_only_sync(
+        payload: OrderCreate,
+        idempotency_key: Optional[str],
+        start_ts: float,
+    ) -> Tuple[OrderResponse, Optional[Dict[str, Any]]]:
+        """Pure PostgreSQL row-lock baseline (used only when CONCURRENCY_MODE='db_only')."""
+        db: Session = SessionLocal()
+        product_id = payload.product_id
+        quantity = payload.quantity
+        try:
+            if idempotency_key:
+                existing_order = (
+                    db.query(Order)
+                    .filter(Order.idempotency_key == idempotency_key)
+                    .first()
+                )
+                if existing_order:
+                    return OrderResponse.model_validate(existing_order), None
+
+            db_product = (
+                db.query(Product)
+                .filter(Product.id == product_id)
+                .with_for_update()
+                .first()
+            )
+            if not db_product:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail={
+                        "detail": f"Product {product_id} not found.",
+                        "error_code": "PRODUCT_NOT_FOUND",
+                    },
+                )
+            if db_product.stock < quantity:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "detail": "Flash sale item is sold out or has insufficient quantity.",
+                        "error_code": "INSUFFICIENT_STOCK",
+                    },
+                )
+
+            unit_price = float(db_product.price)
+            total_amount = round(unit_price * quantity, 2)
+            db_product.stock -= quantity
+            db_product.version += 1
+            elapsed_ms = max(1, int((time.perf_counter() - start_ts) * 1000))
+
+            new_order = Order(
+                user_id=payload.user_id,
+                product_id=product_id,
+                quantity=quantity,
+                total_amount=total_amount,
+                latency_ms=elapsed_ms,
+                status="CONFIRMED",
+                idempotency_key=idempotency_key,
+            )
+            db.add(new_order)
+            db.commit()
+            db.refresh(new_order)
+
+            event_payload = EventPublisher.build_order_event(
+                order_id=new_order.id,
+                user_id=new_order.user_id,
+                product_id=product_id,
+                quantity=quantity,
+                unit_price=unit_price,
+                latency_ms=elapsed_ms,
+                created_at=new_order.created_at,
+            )
+            return OrderResponse.model_validate(new_order), event_payload
+        except HTTPException:
+            db.rollback()
+            raise
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "detail": "Duplicate transaction or constraint violation occurred.",
+                    "error_code": "DUPLICATE_ORDER",
+                },
+            )
+        except Exception as exc:
+            db.rollback()
+            logger.error(f"[DB_ONLY_ERROR] {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "detail": "Database transaction failed.",
+                    "error_code": "DATABASE_ERROR",
+                },
+            )
+        finally:
+            db.close()
+
+    @staticmethod
+    async def process_order_async(
+        payload: OrderCreate,
+        idempotency_key: Optional[str] = None,
+    ) -> Tuple[OrderResponse, Optional[Dict[str, Any]]]:
+        """Non-blocking flash sale order pipeline: Async Redis Gate -> Lazy PostgreSQL Commit."""
+        start_ts = time.perf_counter()
+
+        if settings.CONCURRENCY_MODE == "db_only":
+            return await run_in_threadpool(
+                OrderService._process_order_db_only_sync,
+                payload,
+                idempotency_key,
+                start_ts,
+            )
+
+        lock_acquired = False
+        try:
+            # Step 1: Non-blocking Redis Idempotency Check (zero DB connections)
+            if idempotency_key:
+                cached_order = await inventory_service.get_idempotency_record_async(
+                    idempotency_key
+                )
+                if cached_order is not None:
+                    logger.debug(
+                        f"[IDEMPOTENT_RETRY_REDIS] order_id={cached_order.get('id')} "
+                        f"idempotency_key='{idempotency_key}'"
+                    )
+                    return OrderResponse(**cached_order), None
+
+                lock_acquired = await inventory_service.acquire_idempotency_lock_async(
+                    idempotency_key
+                )
+                if not lock_acquired:
+                    for _ in range(3):
+                        await asyncio.sleep(0.025)
+                        cached_order = await inventory_service.get_idempotency_record_async(
+                            idempotency_key
+                        )
+                        if cached_order is not None:
+                            return OrderResponse(**cached_order), None
+
+            # Step 2: Non-blocking Redis Lua Atomic Stock Gate (zero DB connections)
+            is_deducted, remaining_stock = await inventory_service.deduct_stock_atomic_async(
+                payload.product_id, payload.quantity
+            )
+            if not is_deducted:
+                if remaining_stock == -1:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail={
+                            "detail": "Flash sale item is sold out or has insufficient quantity.",
+                            "error_code": "INSUFFICIENT_STOCK",
+                        },
+                    )
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "detail": (
+                            f"Product {payload.product_id} is not initialized for flash sale in cache."
+                        ),
+                        "error_code": "PRODUCT_NOT_INITIALIZED",
+                    },
+                )
+
+            # Step 3: Lazy PostgreSQL Session Acquisition (only winners touch the DB pool)
+            order_resp, event_payload = await run_in_threadpool(
+                OrderService._persist_order_sync,
+                payload,
+                idempotency_key,
+                remaining_stock,
+                start_ts,
+            )
+
+            # Step 4: Cache idempotent result in Redis for instant subsequent retries
+            if idempotency_key:
+                await inventory_service.save_idempotency_record_async(
+                    idempotency_key, order_resp.model_dump(mode="json")
+                )
+
+            return order_resp, event_payload
+        finally:
+            if idempotency_key and lock_acquired:
+                try:
+                    await inventory_service.release_idempotency_lock_async(idempotency_key)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def process_order(
+        payload: OrderCreate,
+        db: Session,
+        idempotency_key: Optional[str] = None,
+    ) -> Tuple[Order, Optional[Dict[str, Any]]]:
+        """Synchronous helper preserved for direct unit testing or sync callers."""
+        start_ts = time.perf_counter()
+
+        if idempotency_key:
+            existing_order = (
+                db.query(Order)
+                .filter(Order.idempotency_key == idempotency_key)
+                .first()
+            )
+            if existing_order:
+                return existing_order, None
+
+        is_deducted, remaining_stock = inventory_service.deduct_stock_atomic(
+            payload.product_id, payload.quantity
+        )
+        if not is_deducted:
+            if remaining_stock == -1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "detail": "Flash sale item is sold out or has insufficient quantity.",
+                        "error_code": "INSUFFICIENT_STOCK",
+                    },
+                )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "detail": (
+                        f"Product {payload.product_id} is not initialized for flash sale in cache."
+                    ),
+                    "error_code": "PRODUCT_NOT_INITIALIZED",
+                },
+            )
+
+        try:
+            db_product = (
+                db.query(Product)
+                .filter(Product.id == payload.product_id)
+                .with_for_update()
+                .first()
+            )
+            if not db_product or db_product.stock < payload.quantity:
+                raise ValueError("Invalid product or insufficient DB stock.")
+
+            unit_price = float(db_product.price)
+            total_amount = round(unit_price * payload.quantity, 2)
+            db_product.stock -= payload.quantity
+            db_product.version += 1
+            elapsed_ms = max(1, int((time.perf_counter() - start_ts) * 1000))
+
+            new_order = Order(
+                user_id=payload.user_id,
+                product_id=payload.product_id,
+                quantity=payload.quantity,
+                total_amount=total_amount,
+                latency_ms=elapsed_ms,
+                status="CONFIRMED",
+                idempotency_key=idempotency_key,
+            )
+            db.add(new_order)
+            db.commit()
+            db.refresh(new_order)
+
+            event_payload = EventPublisher.build_order_event(
+                order_id=new_order.id,
+                user_id=new_order.user_id,
+                product_id=payload.product_id,
+                quantity=payload.quantity,
+                unit_price=unit_price,
+                latency_ms=elapsed_ms,
+                created_at=new_order.created_at,
+            )
+            return new_order, event_payload
+        except Exception as exc:
+            db.rollback()
+            inventory_service.compensatory_increment(payload.product_id, payload.quantity)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "detail": f"Database transaction failed: {exc}",
                     "error_code": "DATABASE_ERROR",
                 },
             )
