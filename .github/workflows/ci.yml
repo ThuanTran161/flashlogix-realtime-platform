@@ -68,7 +68,7 @@ jobs:
           pip install -r requirements.txt ruff
 
       - name: Lint with Ruff
-        run: ruff check app streaming lakehouse scripts dashboard tests
+        run: ruff check app streaming lakehouse scripts tests
 
       - name: Run Pytest Suite
         run: pytest tests/ -v

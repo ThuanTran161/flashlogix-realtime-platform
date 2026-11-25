@@ -2,9 +2,9 @@
 .SYNOPSIS
     FlashLogix All-in-One Launcher & Control Script.
 .USAGE
-    .\run.ps1             # Khoi chay TOAN BO he thong (Docker + DB/Redis + FastAPI + AuditConsumer + UI)
+    .\run.ps1             # Khoi chay TOAN BO he thong (Docker + DB/Redis + React Build + FastAPI + AuditConsumer)
     .\run.ps1 start       # Nhu tren (them -NoBrowser neu khong muon tu mo trinh duyet)
-    .\run.ps1 stop        # Tat API, AuditConsumer, Streamlit (giu nguyen Docker & du lieu)
+    .\run.ps1 stop        # Tat FastAPI & AuditConsumer (giu nguyen Docker & du lieu)
     .\run.ps1 down        # Tat app + docker compose down (chi stack FlashLogix)
     .\run.ps1 status      # Xem trang thai Docker + cac service FlashLogix
     .\run.ps1 test        # Chay Ruff lint + toan bo tests Pytest
@@ -22,6 +22,8 @@ $ErrorActionPreference = "Stop"
 
 $RootDir = $PSScriptRoot
 $PythonExe = Join-Path $RootDir ".venv\Scripts\python.exe"
+$FrontendDir = Join-Path $RootDir "frontend"
+$FrontendIndex = Join-Path $FrontendDir "dist\index.html"
 $RuntimeDir = Join-Path $RootDir ".runtime"
 $LogDir = Join-Path $RuntimeDir "logs"
 $PidFile = Join-Path $RuntimeDir "pids.json"
@@ -49,6 +51,23 @@ function Ensure-EnvAndPython {
         Write-Step "Da tao .env tu .env.example"
     }
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+}
+
+function Ensure-FrontendBuild {
+    if (!(Test-Path $FrontendIndex)) {
+        Write-Step "Chua co frontend/dist - dang cai va build React Console..."
+        Push-Location $FrontendDir
+        try {
+            if (!(Test-Path (Join-Path $FrontendDir "node_modules"))) {
+                & npm.cmd install
+                if ($LASTEXITCODE -ne 0) { throw "npm install that bai." }
+            }
+            & npm.cmd run build
+            if ($LASTEXITCODE -ne 0) { throw "npm run build that bai." }
+        } finally {
+            Pop-Location
+        }
+    }
 }
 
 function Stop-TrackedProcesses {
@@ -158,9 +177,10 @@ with engine.begin() as conn:
 
 function Start-AllInOne {
     Ensure-EnvAndPython
+    Ensure-FrontendBuild
     Stop-TrackedProcesses
 
-    Write-Step "1/5 Khoi dong ha tang Docker FlashLogix (co lap khoi cac project khac)..."
+    Write-Step "1/4 Khoi dong ha tang Docker FlashLogix (co lap khoi cac project khac)..."
     Push-Location $RootDir
     try {
         & docker compose up -d | Out-Null
@@ -173,10 +193,10 @@ function Start-AllInOne {
     Wait-DockerService "flashlogix_minio" 30
     Write-Ok "Docker FlashLogix san sang (Postgres:5433, Redis:6380, Kafka:9094, MinIO:9000)."
 
-    Write-Step "2/5 Dong bo schema & ton kho ban dau..."
+    Write-Step "2/4 Dong bo schema & ton kho ban dau..."
     Ensure-BaselineData
 
-    Write-Step "3/5 Khoi dong FastAPI Backend (4 workers, port 8000)..."
+    Write-Step "3/4 Khoi dong FastAPI Backend & Ops Console UI (4 workers, port 8000)..."
     $apiOut = Join-Path $LogDir "api.stdout.log"
     $apiErr = Join-Path $LogDir "api.stderr.log"
     $apiProc = Start-Process -FilePath $PythonExe `
@@ -190,9 +210,9 @@ function Start-AllInOne {
     if (!(Wait-HttpReady "http://127.0.0.1:8000/health" 35)) {
         throw "FastAPI khong phan hoi /health. Kiem tra log tai '$apiErr'."
     }
-    Write-Ok "FastAPI API san sang: http://localhost:8000 (Swagger: http://localhost:8000/docs)"
+    Write-Ok "FastAPI + Ops Console san sang tai http://localhost:8000"
 
-    Write-Step "4/5 Khoi dong Kafka Audit & Fraud Consumer (nen)..."
+    Write-Step "4/4 Khoi dong Kafka Audit & Fraud Consumer (nen)..."
     $consOut = Join-Path $LogDir "audit_consumer.stdout.log"
     $consErr = Join-Path $LogDir "audit_consumer.stderr.log"
     $consProc = Start-Process -FilePath $PythonExe `
@@ -204,31 +224,14 @@ function Start-AllInOne {
         -PassThru
     Write-Ok "AuditConsumer dang chay (PID=$($consProc.Id))."
 
-    Write-Step "5/5 Khoi dong Streamlit Command Center UI (port 8501)..."
-    $uiOut = Join-Path $LogDir "dashboard.stdout.log"
-    $uiErr = Join-Path $LogDir "dashboard.stderr.log"
-    $uiProc = Start-Process -FilePath $PythonExe `
-        -ArgumentList "-m", "streamlit", "run", "dashboard/streamlit_app.py", "--server.port", "8501", "--server.headless", "true" `
-        -WorkingDirectory $RootDir `
-        -RedirectStandardOutput $uiOut `
-        -RedirectStandardError $uiErr `
-        -WindowStyle Hidden `
-        -PassThru
-
-    if (!(Wait-HttpReady "http://127.0.0.1:8501" 35)) {
-        throw "Streamlit UI khong phan hoi port 8501. Kiem tra log tai '$uiErr'."
-    }
-
     @{
         api            = $apiProc.Id
         audit_consumer = $consProc.Id
-        dashboard      = $uiProc.Id
     } | ConvertTo-Json | Set-Content -Path $PidFile -Encoding UTF8
 
-    Write-Ok "Streamlit Command Center san sang: http://localhost:8501"
     Write-Host ""
     Write-Host "================ FLASHLOGIX PLATFORM READY ================" -ForegroundColor Green
-    Write-Host "  Command Center UI : http://localhost:8501"
+    Write-Host "  Ops Console UI    : http://localhost:8000"
     Write-Host "  API Swagger Docs  : http://localhost:8000/docs"
     Write-Host "  Telemetry Metrics : http://localhost:8000/metrics"
     Write-Host "  MinIO Console     : http://localhost:9001  (minioadmin / minioadminpassword)"
@@ -237,7 +240,7 @@ function Start-AllInOne {
     Write-Host "===========================================================" -ForegroundColor Green
 
     if (-not $NoBrowser) {
-        Start-Process "http://localhost:8501"
+        Start-Process "http://localhost:8000"
     }
 }
 
@@ -267,7 +270,7 @@ switch ($Action) {
     }
     "stop" {
         Stop-TrackedProcesses
-        Write-Ok "Da dung FastAPI, AuditConsumer va Streamlit."
+        Write-Ok "Da dung FastAPI va AuditConsumer."
     }
     "down" {
         Stop-TrackedProcesses
@@ -286,7 +289,7 @@ switch ($Action) {
         Ensure-EnvAndPython
         Push-Location $RootDir
         try {
-            & $PythonExe -m ruff check app streaming lakehouse scripts dashboard tests
+            & $PythonExe -m ruff check app streaming lakehouse scripts tests
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             & $PythonExe -m pytest tests/ -v
             exit $LASTEXITCODE

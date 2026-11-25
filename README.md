@@ -1,18 +1,18 @@
 # ⚡ FlashLogix — High-Concurrency Transaction Engine & Real-Time Lakehouse Platform
 
 > **An end-to-end intersection of High-Concurrency Backend Engineering (OLTP) and Event-Driven Data Engineering (OLAP).**  
-> Built with **FastAPI, Async Redis (Lua Atomic + Read-Through Cache + Multi-Worker Telemetry), PostgreSQL (Transactional Outbox + Star Schema), Apache Kafka (KRaft), PySpark Structured Streaming, MinIO Lakehouse, Kimball Star Schema (SCD Type 2), Locust, Streamlit, and GitHub Actions CI.**
+> Built with **FastAPI, Async Redis (Lua Atomic + Read-Through Cache + Multi-Worker Telemetry), PostgreSQL (Transactional Outbox + Star Schema), Apache Kafka (KRaft), PySpark Structured Streaming, MinIO Lakehouse, Kimball Star Schema (SCD Type 2), Locust, GitHub Actions CI, and a React/TypeScript Ops Console.**
 
 ---
 
 ## 1. System Architecture
 
 ```text
-[ Locust Load Test (300+ Concurrent Users) ]
-                   │
-                   ▼
-       [ FastAPI Async API ] ──► 1. Middleware & Multi-Worker Observability (/metrics JSON & Prometheus, X-Request-ID)
-          │           │             (O(1) local buffer + async Redis HINCRBY aggregation across 4 Uvicorn workers)
+[ Locust Load Test (300+ Concurrent Users) ]       [ Internal Ops Console (React + TypeScript) ]
+                   │                                                      │ (Served via FastAPI :8000)
+                   ▼                                                      ▼
+       [ FastAPI Async API ] ──► 1. Middleware, Ops API (/api/v1/ops/*) & Multi-Worker Telemetry (/metrics)
+          │           │             (O(1) local buffer + async Redis HINCRBY across 4 Uvicorn workers)
           │           │
           │           ├────────► 2. Async Redis Gate (redis.asyncio, Zero DB Pool Contention)
           │           │              ├── Idempotency-Key Cache & In-Flight Lock (idem:order:{key})
@@ -43,9 +43,6 @@
                                                        ├── Dim_Users (SCD Type 2 + Indexes)
                                                        ├── Dim_Products / Dim_Date
                                                        └── Fact_Flash_Sale_Orders (Unified Fraud Flags)
-                                                                             │
-                                                                             ▼
-                                                             [ Streamlit Command Center ]
 ```
 
 ---
@@ -64,7 +61,7 @@
 * **Unified Velocity Fraud Detection (Consumer -> Silver -> Gold):** Both `OrderAuditConsumer` (real-time Redis sliding 60s window) and `batch_gold_aggregation.py` (`apply_unified_velocity_fraud_flags`, >= `FRAUD_VELOCITY_THRESHOLD_PER_MIN` per minute) propagate `is_fraudulent` into `Fact_Flash_Sale_Orders` via idempotent upsert.
 * **PySpark Structured Streaming & PII Governance:** Enforces explicit `StructType` schemas, strict `UTC` session partitioning (`order_date=YYYY-MM-DD/`), hashes customer PII (`user_id` -> `masked_user_id`) using salted SHA-256, deduplicates by `order_id`, and computes 1-minute tumbling window aggregations with watermarking.
 * **Partition-Pruned Batch Bulk Gold Star Schema & DQ Audit:** `lakehouse/batch_gold_aggregation.py` supports incremental date-partition pruning (`--date YYYY-MM-DD`) and set-based `executemany` bulk upserts into indexed `Dim_Date`, `Dim_Products`, SCD Type 2 `Dim_Users`, and `Fact_Flash_Sale_Orders`, exporting an automated reconciliation & PII audit report (`gold/data_quality_report/latest.json`).
-* **1-Command All-in-One Launcher & Interactive Command Center:** `run.ps1` orchestrates the isolated Docker stack, schema/seed sync, 4-worker Uvicorn API, Kafka `OrderAuditConsumer`, and the 5-tab Streamlit Command Center (`dashboard/streamlit_app.py`) for visual order testing, burst/bot simulations, Outbox replay, and Silver/Gold ETL triggers.
+* **1-Command All-in-One Launcher & Internal Ops Console:** `run.ps1` orchestrates the isolated Docker stack, schema/seed sync, 4-worker Uvicorn API (serving both REST APIs and the compiled React Ops Console at `http://localhost:8000`), and Kafka `OrderAuditConsumer`.
 * **Hardened Container & CI/CD:** Non-root `Dockerfile` (`appuser`) with `HEALTHCHECK` and multi-worker `uvicorn`, paired with `.github/workflows/ci.yml` (`ruff check` + `pytest tests/ -v`).
 
 ---
@@ -112,12 +109,12 @@ Flashlogix_Platform/
 ├── .github/workflows/
 │   └── ci.yml                  # Automated Ruff lint + Pytest CI (Postgres 15, Redis 7.2, Java 17)
 ├── app/
-│   ├── api/v1/                 # FastAPI async routes (paginated products, filtered orders, outbox replay)
+│   ├── api/v1/                 # FastAPI async routes (products, orders, outbox replay, ops control plane)
 │   ├── core/                   # Settings, SQLAlchemy pool & CHECK constraints, MinIO S3, Shared Redis Telemetry
 │   ├── models/                 # SQLAlchemy ORM models (Product, Order, OutboxEvent)
 │   ├── schemas/                # Pydantic v2 validation & error envelopes
 │   ├── services/               # Async/Sync Redis Lua inventory, Order, Outbox, and Kafka producer services
-│   └── main.py                 # FastAPI entrypoint, tracing middleware, /health, /metrics
+│   └── main.py                 # FastAPI entrypoint, tracing middleware, /health, /metrics, SPA serving
 ├── streaming/
 │   ├── audit_consumer.py       # Kafka consumer: velocity fraud check, DLQ + MinIO Bronze/Quarantine
 │   ├── transformations.py      # PySpark schema enforcement, quarantine split, PII masking, windows
@@ -125,12 +122,11 @@ Flashlogix_Platform/
 │   └── star_schema.sql         # Indexed PostgreSQL Kimball Star Schema DDL (SCD Type 2)
 ├── lakehouse/
 │   └── batch_gold_aggregation.py # Partition-pruned batch bulk Gold Star Schema ETL + DQ Audit
-├── dashboard/
-│   └── streamlit_app.py        # Interactive 5-tab Command Center UI (Controls, Telemetry, Outbox/DLQ, ETL, DQ)
+├── frontend/                   # React + TypeScript + Tailwind Ops Console (served via FastAPI :8000)
 ├── scripts/
 │   └── benchmark_compare.py    # Automated Before/After Locust benchmark & Lakehouse E2E verifier
 ├── tests/
-│   ├── test_backend.py         # Observability, query APIs, Outbox replay, Idempotency, Lazy DB & CHECK tests
+│   ├── test_backend.py         # Observability, query APIs, Ops API, Outbox replay, Idempotency & CHECK tests
 │   ├── test_streaming_and_gold.py # PySpark quarantine/PII, DLQ validation, unified fraud, SCD2 & batch upsert tests
 │   └── locustfile.py           # High-concurrency Locust load testing suite
 ├── run.ps1                     # 1-command All-in-One launcher (start / stop / down / status / test / bench)
@@ -146,19 +142,19 @@ Flashlogix_Platform/
 
 ### Option A: 1-Command All-in-One Launcher (Recommended)
 
-Start the entire FlashLogix stack (**isolated Docker containers + DB/Redis seed + 4-worker FastAPI + Kafka AuditConsumer + Interactive Command Center UI**) with a single command:
+Start the entire FlashLogix stack (**isolated Docker containers + DB/Redis seed + React build + 4-worker FastAPI + Kafka AuditConsumer**) with a single command:
 
 ```powershell
 .\run.ps1
 ```
 
-Once ready, your browser opens **`http://localhost:8501`** (5-tab Command Center for live orders, burst & bot simulation, Outbox replay, Silver/Gold ETL triggers, and Data Quality SLA audit).
+Once ready, your browser opens **`http://localhost:8000`** (internal Ops & Lakehouse Console served directly by FastAPI, with Swagger at `/docs` and telemetry at `/metrics`).
 
 | Command | Action |
 | :--- | :--- |
-| `.\run.ps1` (or `.\run.ps1 start`) | Starts Docker (`flashlogix_*`), syncs schema/stock, launches 4-worker API (`:8000`), `AuditConsumer`, and Streamlit UI (`:8501`) |
+| `.\run.ps1` (or `.\run.ps1 start`) | Starts Docker (`flashlogix_*`), builds UI if needed, syncs schema/stock, launches 4-worker API (`:8000`) & `AuditConsumer` |
 | `.\run.ps1 status` | Checks `flashlogix_*` container health and running app PIDs |
-| `.\run.ps1 stop` | Cleanly stops FastAPI, `AuditConsumer`, and Streamlit (keeps Docker & persisted data running) |
+| `.\run.ps1 stop` | Cleanly stops FastAPI and `AuditConsumer` (keeps Docker & persisted data running) |
 | `.\run.ps1 down` | Stops app processes and runs `docker compose down` for FlashLogix only |
 | `.\run.ps1 test` | Runs `ruff check` + full `pytest tests/ -v` suite |
 | `.\run.ps1 bench` | Runs the automated 300-VU Locust Before/After benchmark + Lakehouse E2E verification |
@@ -168,19 +164,19 @@ Once ready, your browser opens **`http://localhost:8501`** (5-tab Command Center
 ### Option B: Manual Component Execution (Advanced)
 
 ```powershell
-# 1. Start infrastructure & run test suite
+# 1. Start infrastructure, build UI & run test suite
 Copy-Item .env.example .env
 docker compose up -d
-.\.venv\Scripts\python.exe -m ruff check app streaming lakehouse scripts dashboard tests
+cd frontend; npm install; npm run build; cd ..
+.\.venv\Scripts\python.exe -m ruff check app streaming lakehouse scripts tests
 .\.venv\Scripts\python.exe -m pytest tests/ -v
 
-# 2. Run API (http://localhost:8000/docs, /health, /metrics) & AuditConsumer
+# 2. Run API + Ops Console (http://localhost:8000, /docs, /health, /metrics) & AuditConsumer
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
 .\.venv\Scripts\python.exe -m streaming.audit_consumer
 
-# 3. Run PySpark Silver Streaming, Gold Star Schema ETL, Benchmark, or Dashboard
+# 3. Run PySpark Silver Streaming, Gold Star Schema ETL, or Benchmark
 .\.venv\Scripts\python.exe -m streaming.spark_stream_orders --starting-offsets earliest
 .\.venv\Scripts\python.exe -m lakehouse.batch_gold_aggregation
 .\.venv\Scripts\python.exe scripts/benchmark_compare.py --reset-clean --verify-lakehouse
-.\.venv\Scripts\python.exe -m streamlit run dashboard/streamlit_app.py
 ```

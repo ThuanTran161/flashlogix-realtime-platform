@@ -320,3 +320,24 @@ def test_db_check_constraint_blocks_negative_stock():
         db.rollback()
     finally:
         db.close()
+
+
+def test_ops_control_plane_and_console_root():
+    """Verifies Ops REST endpoints (/api/v1/ops/*) and console root serving."""
+    ov = client.get("/api/v1/ops/overview")
+    assert ov.status_code == 200
+    payload = ov.json()["data"]
+    assert "oltp" in payload
+    assert "inventory" in payload
+    assert "outbox" in payload
+
+    silver_status = client.get("/api/v1/ops/jobs/silver-stream")
+    assert silver_status.status_code == 200
+    assert silver_status.json()["data"]["status"] in {"IDLE", "RUNNING", "COMPLETED", "FAILED"}
+
+    bad_gold = client.post("/api/v1/ops/jobs/gold-etl", json={"target_date": "invalid-date"})
+    assert bad_gold.status_code == 400
+    assert bad_gold.json()["error_code"] == "INVALID_DATE_FORMAT"
+
+    root_resp = client.get("/")
+    assert root_resp.status_code == 200

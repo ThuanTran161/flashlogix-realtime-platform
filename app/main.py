@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import os
 import sys
 import time
 from typing import AsyncGenerator
@@ -6,7 +7,8 @@ import uuid
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from loguru import logger
 from sqlalchemy import text
 
@@ -18,6 +20,10 @@ from app.core.storage import ensure_lakehouse_bucket
 from app.core.telemetry import telemetry
 from app.services.inventory_service import inventory_service, redis_client
 from app.services.kafka_producer import event_publisher
+
+FRONTEND_DIST_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+)
 
 
 def _configure_logging() -> None:
@@ -96,7 +102,7 @@ async def request_tracing_and_telemetry_middleware(request: Request, call_next):
 
 @app.exception_handler(HTTPException)
 async def custom_http_exception_handler(request: Request, exc: HTTPException):
-    """Enforces standard HTTP error envelope: {"detail": "...", "error_code": "..."}."""
+    """Enforces standard HTTP error envelope: {\"detail\": \"...\", \"error_code\": \"...\"}."""
     if isinstance(exc.detail, dict) and "error_code" in exc.detail:
         payload = exc.detail
     else:
@@ -224,3 +230,20 @@ async def metrics_endpoint(format: str = "json"):
 
 app.include_router(api_v1_router)
 app.include_router(direct_orders_router)
+
+_assets_dir = os.path.join(FRONTEND_DIST_DIR, "assets")
+if os.path.isdir(_assets_dir):
+    app.mount("/assets", StaticFiles(directory=_assets_dir), name="frontend-assets")
+
+
+@app.get("/", include_in_schema=False)
+async def serve_console_root():
+    index_path = os.path.join(FRONTEND_DIST_DIR, "index.html")
+    if os.path.isfile(index_path):
+        return FileResponse(index_path)
+    return {
+        "app": settings.APP_NAME,
+        "docs": "/docs",
+        "health": "/health",
+        "metrics": "/metrics",
+    }

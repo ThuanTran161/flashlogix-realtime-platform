@@ -10,7 +10,7 @@ filterwarnings = [
 [tool.ruff]
 target-version = "py312"
 line-length = 110
-exclude = [".venv", "__pycache__", ".pytest_cache"]
+exclude = [".venv", "__pycache__", ".pytest_cache", "frontend"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W"]
@@ -18,4 +18,3 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "scripts/benchmark_compare.py" = ["E402"]
-"dashboard/streamlit_app.py" = ["E402"]
