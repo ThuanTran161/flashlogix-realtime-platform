@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import SessionLocal
+from app.core.telemetry import telemetry
 from app.models.order import Order
 from app.models.product import Product
 from app.schemas.order import OrderCreate, OrderResponse
@@ -39,6 +40,7 @@ class OrderService:
                 if existing_order:
                     # Restore the stock unit deducted before discovering DB idempotency hit
                     inventory_service.compensatory_increment(product_id, quantity)
+                    telemetry.inc("idempotency_db_hits_total")
                     logger.info(
                         f"[IDEMPOTENT_RETRY_DB] order_id={existing_order.id} "
                         f"idempotency_key='{idempotency_key}'"
@@ -89,6 +91,7 @@ class OrderService:
                 created_at=new_order.created_at,
             )
 
+            telemetry.inc("orders_committed_total")
             logger.info(
                 f"[ORDER_COMMITTED] order_id={new_order.id} user_id={new_order.user_id} "
                 f"product_id={product_id} qty={quantity} total={total_amount} "
@@ -99,6 +102,7 @@ class OrderService:
         except IntegrityError as ie:
             db.rollback()
             inventory_service.compensatory_increment(product_id, quantity)
+            telemetry.inc("compensatory_rollbacks_total")
             logger.error(f"[INTEGRITY_VIOLATION] Rolled back DB & restored Redis stock: {ie}")
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -110,6 +114,7 @@ class OrderService:
         except Exception as exc:
             db.rollback()
             restored = inventory_service.compensatory_increment(product_id, quantity)
+            telemetry.inc("compensatory_rollbacks_total")
             logger.critical(
                 f"[COMPENSATORY_ROLLBACK] DB transaction failed: {exc}. "
                 f"Restored {quantity} items to Redis (current RAM stock: {restored})."
@@ -195,6 +200,7 @@ class OrderService:
                 latency_ms=elapsed_ms,
                 created_at=new_order.created_at,
             )
+            telemetry.inc("orders_committed_total")
             return OrderResponse.model_validate(new_order), event_payload
         except HTTPException:
             db.rollback()
@@ -245,6 +251,7 @@ class OrderService:
                     idempotency_key
                 )
                 if cached_order is not None:
+                    telemetry.inc("idempotency_redis_hits_total")
                     logger.debug(
                         f"[IDEMPOTENT_RETRY_REDIS] order_id={cached_order.get('id')} "
                         f"idempotency_key='{idempotency_key}'"
@@ -255,12 +262,13 @@ class OrderService:
                     idempotency_key
                 )
                 if not lock_acquired:
-                    for _ in range(3):
+                    for _ in range(8):
                         await asyncio.sleep(0.025)
                         cached_order = await inventory_service.get_idempotency_record_async(
                             idempotency_key
                         )
                         if cached_order is not None:
+                            telemetry.inc("idempotency_redis_hits_total")
                             return OrderResponse(**cached_order), None
 
             # Step 2: Non-blocking Redis Lua Atomic Stock Gate (zero DB connections)
@@ -269,6 +277,7 @@ class OrderService:
             )
             if not is_deducted:
                 if remaining_stock == -1:
+                    telemetry.inc("redis_gate_rejected_out_of_stock_total")
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail={
@@ -276,6 +285,7 @@ class OrderService:
                             "error_code": "INSUFFICIENT_STOCK",
                         },
                     )
+                telemetry.inc("redis_gate_cache_miss_total")
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail={

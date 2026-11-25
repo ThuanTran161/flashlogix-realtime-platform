@@ -73,7 +73,7 @@ def load_data_quality_report():
 
 def count_lakehouse_objects():
     s3 = get_s3_client()
-    counts = {"bronze": 0, "silver": 0, "gold": 0}
+    counts = {"bronze": 0, "silver": 0, "gold": 0, "quarantine": 0}
     for layer in counts:
         resp = s3.list_objects_v2(Bucket=settings.MINIO_BUCKET, Prefix=f"{layer}/")
         counts[layer] = len(resp.get("Contents", []))
@@ -107,11 +107,11 @@ try:
             st.info("No products created yet.")
 
     with right:
-        st.subheader("🗄️ MinIO Medallion Lakehouse Layers")
+        st.subheader("🗄️ MinIO Medallion Lakehouse & Quarantine")
         try:
             lake_counts = count_lakehouse_objects()
             lake_df = pd.DataFrame(
-                [{"Layer": k.upper(), "Parquet Files": v} for k, v in lake_counts.items()]
+                [{"Layer": k.upper(), "Parquet/JSON Files": v} for k, v in lake_counts.items()]
             )
             st.bar_chart(lake_df.set_index("Layer"))
         except Exception as exc:
@@ -134,11 +134,12 @@ try:
     st.subheader("🛡️ Data Quality & Lakehouse Reconciliation SLA")
     try:
         dq = load_data_quality_report()
-        d1, d2, d3, d4 = st.columns(4)
+        d1, d2, d3, d4, d5 = st.columns(5)
         d1.metric("OLTP ↔ Gold Parity", f"{dq.get('order_parity_pct', 0):.2f}%")
         d2.metric("Revenue Delta", f"${dq.get('revenue_delta', 0):.2f}")
         d3.metric("Duplicates Filtered", f"{dq.get('duplicates_filtered', 0):,}")
-        d4.metric(
+        d4.metric("Quarantined / DLQ", f"{dq.get('quarantined_objects', 0):,}")
+        d5.metric(
             "PII Compliance",
             "PASS (0 violations)" if dq.get("pii_compliance_passed") else "FAIL",
         )

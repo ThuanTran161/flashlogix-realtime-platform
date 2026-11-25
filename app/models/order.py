@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Index
+from sqlalchemy import CheckConstraint, Column, DateTime, Float, ForeignKey, Index, Integer, String
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 
@@ -17,12 +17,19 @@ class Order(Base):
     latency_ms = Column(Integer, nullable=True)
     status = Column(String(50), nullable=False, default="CONFIRMED")
     idempotency_key = Column(String(128), unique=True, nullable=True, index=True)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), nullable=False)
+    created_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
+        nullable=False,
+    )
 
-    product = relationship("Product", backref="orders", lazy="joined")
+    # Use lazy="select" to avoid unnecessary LEFT OUTER JOIN on hot order queries
+    product = relationship("Product", backref="orders", lazy="select")
 
     __table_args__ = (
         Index("idx_orders_user_created", "user_id", "created_at"),
+        CheckConstraint("quantity > 0", name="ck_orders_quantity_positive"),
+        CheckConstraint("total_amount >= 0", name="ck_orders_total_non_negative"),
     )
 
     def __repr__(self) -> str:

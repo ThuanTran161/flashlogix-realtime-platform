@@ -1,9 +1,10 @@
 """PySpark Structured Streaming Pipeline for FlashLogix Lakehouse.
 
 Consumes order events from Kafka (`flashsale.orders`), enforces explicit
-StructType schema, applies SHA-256 salted PII masking, persists clean Silver
-Parquet records to MinIO/S3 with isolated checkpointing, and computes 1-minute
-tumbling window aggregations.
+StructType schema, routes malformed payloads to MinIO `quarantine/orders_stream`,
+applies SHA-256 salted PII masking, persists clean Silver Parquet records to
+MinIO/S3 with isolated checkpointing, and computes 1-minute tumbling window
+aggregations.
 """
 import argparse
 import os
@@ -22,7 +23,7 @@ from app.core.storage import ensure_lakehouse_bucket
 from streaming.transformations import (
     apply_pii_masking_and_clean,
     compute_windowed_sales,
-    parse_kafka_order_events,
+    split_valid_and_quarantine_events,
 )
 
 
@@ -55,13 +56,15 @@ def run_streaming_pipeline(
     starting_offsets: str = "latest",
     available_now: bool = False,
 ) -> None:
-    """Starts the Kafka -> Silver Parquet & Windowed Aggregation streaming queries."""
+    """Starts the Kafka -> Silver/Quarantine Parquet & Windowed Aggregation queries."""
     ensure_lakehouse_bucket(settings.MINIO_BUCKET)
     spark = create_spark_session()
 
     base_s3_path = f"s3a://{settings.MINIO_BUCKET}"
     silver_path = f"{base_s3_path}/silver/orders"
+    quarantine_path = f"{base_s3_path}/quarantine/orders_stream"
     checkpoint_path = f"{base_s3_path}/checkpoints/silver_orders_chk"
+    quarantine_checkpoint_path = f"{base_s3_path}/checkpoints/quarantine_orders_chk"
     window_checkpoint_path = f"{base_s3_path}/checkpoints/window_sales_chk"
 
     logger.info(
@@ -78,7 +81,7 @@ def run_streaming_pipeline(
         .load()
     )
 
-    parsed_orders = parse_kafka_order_events(raw_kafka_stream)
+    parsed_orders, quarantine_orders = split_valid_and_quarantine_events(raw_kafka_stream)
     secure_silver_orders = apply_pii_masking_and_clean(
         parsed_orders, salt=settings.PII_SALT
     ).select(
@@ -91,6 +94,7 @@ def run_streaming_pipeline(
         col("unit_price"),
         col("total_amount"),
         col("latency_ms"),
+        col("is_fraudulent"),
         col("order_time"),
         col("order_date"),
     )
@@ -104,11 +108,20 @@ def run_streaming_pipeline(
     )
     if available_now:
         silver_writer = silver_writer.trigger(availableNow=True)
-
     silver_query = silver_writer.start()
+
+    quarantine_writer = (
+        quarantine_orders.writeStream.format("parquet")
+        .option("path", quarantine_path)
+        .option("checkpointLocation", quarantine_checkpoint_path)
+        .outputMode("append")
+    )
+    if available_now:
+        quarantine_writer = quarantine_writer.trigger(availableNow=True)
+    quarantine_query = quarantine_writer.start()
+
     logger.info(
-        f"[SPARK_STREAM] Silver sink started -> path='{silver_path}' "
-        f"checkpoint='{checkpoint_path}'"
+        f"[SPARK_STREAM] Silver sink -> '{silver_path}' | Quarantine sink -> '{quarantine_path}'"
     )
 
     windowed_sales = compute_windowed_sales(secure_silver_orders)
@@ -120,11 +133,11 @@ def run_streaming_pipeline(
     )
     if available_now:
         console_writer = console_writer.trigger(availableNow=True)
-
     console_query = console_writer.start()
 
     if available_now:
         silver_query.awaitTermination()
+        quarantine_query.awaitTermination()
         console_query.awaitTermination()
         logger.info("[SPARK_STREAM] AvailableNow micro-batch completed cleanly.")
         spark.stop()

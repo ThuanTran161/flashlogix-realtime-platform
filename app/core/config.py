@@ -31,9 +31,9 @@ class Settings(BaseSettings):
     POSTGRES_DB: str = "flashlogix_db"
     DATABASE_URL: Optional[str] = None
 
-    # Connection Pool Settings
-    DB_POOL_SIZE: int = 20
-    DB_MAX_OVERFLOW: int = 10
+    # Connection Pool Settings (12 + 8 = 20 max per worker -> 80 max across 4 workers < PG max_connections=100)
+    DB_POOL_SIZE: int = 12
+    DB_MAX_OVERFLOW: int = 8
     DB_POOL_TIMEOUT: int = 30
     DB_POOL_RECYCLE: int = 1800
 
@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     # --- Apache Kafka ---
     KAFKA_BOOTSTRAP_SERVERS: str = "localhost:9094"
     KAFKA_TOPIC_ORDERS: str = "flashsale.orders"
+    KAFKA_TOPIC_ORDERS_DLQ: str = "flashsale.orders.dlq"
     KAFKA_CONSUMER_GROUP: str = "flashlogix_audit_group"
 
     # --- MinIO Lakehouse (S3-Compatible) ---
@@ -57,8 +58,9 @@ class Settings(BaseSettings):
     MINIO_ROOT_PASSWORD: str = "minioadminpassword"
     MINIO_BUCKET: str = "lakehouse"
 
-    # --- Data Governance & Compliance ---
+    # --- Data Governance, Fraud & Compliance ---
     PII_SALT: str = "FLASH_SECRET_SALT_2026"
+    FRAUD_VELOCITY_THRESHOLD_PER_MIN: int = 5
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -1,7 +1,6 @@
 import random
 import uuid
-from locust import HttpUser, task, between, events
-from locust.runners import MasterRunner, WorkerRunner
+from locust import HttpUser, between, task
 
 
 class FlashSaleShopper(HttpUser):
@@ -22,12 +21,12 @@ class FlashSaleShopper(HttpUser):
 
         headers = {
             "Content-Type": "application/json",
-            "Idempotency-Key": idempotency_token
+            "Idempotency-Key": idempotency_token,
         }
         payload = {
             "user_id": simulated_user_id,
             "product_id": 1,
-            "quantity": 1
+            "quantity": 1,
         }
 
         with self.client.post("/orders", json=payload, headers=headers, catch_response=True) as response:

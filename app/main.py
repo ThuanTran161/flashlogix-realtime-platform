@@ -1,18 +1,21 @@
 from contextlib import asynccontextmanager
 import sys
+import time
 from typing import AsyncGenerator
+import uuid
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from loguru import logger
 from sqlalchemy import text
 
 from app.api.v1.orders import router as direct_orders_router
 from app.api.v1.router import api_v1_router
 from app.core.config import settings
-from app.core.database import Base, engine
+from app.core.database import engine, ensure_oltp_schema_and_constraints
 from app.core.storage import ensure_lakehouse_bucket
+from app.core.telemetry import telemetry
 from app.services.inventory_service import inventory_service, redis_client
 from app.services.kafka_producer import event_publisher
 
@@ -34,8 +37,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
 
     try:
-        Base.metadata.create_all(bind=engine)
-        logger.info("Database schemas verified and synchronized.")
+        ensure_oltp_schema_and_constraints()
+        logger.info("Database schemas and CHECK constraints verified and synchronized.")
     except Exception as exc:
         logger.warning(f"Database unavailable on startup: {exc}")
 
@@ -61,7 +64,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(
     title=settings.APP_NAME,
     description="High-Concurrency Flash Sale Transaction Engine & Real-time Event Analytics Platform",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -72,6 +75,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def request_tracing_and_telemetry_middleware(request: Request, call_next):
+    """Attaches X-Request-ID and X-Process-Time-Ms headers and records request telemetry."""
+    request_id = request.headers.get("X-Request-ID") or f"req_{uuid.uuid4().hex[:12]}"
+    start_ts = time.perf_counter()
+    telemetry.inc("http_requests_total")
+
+    response = await call_next(request)
+
+    elapsed_ms = round((time.perf_counter() - start_ts) * 1000.0, 2)
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Process-Time-Ms"] = str(elapsed_ms)
+    telemetry.inc(f"http_status_{response.status_code}_total")
+    return response
 
 
 @app.exception_handler(HTTPException)
@@ -126,6 +145,39 @@ def _check_dependencies_health() -> dict:
     }
 
 
+def _collect_system_metrics() -> dict:
+    snap = telemetry.snapshot()
+    pool = engine.pool
+    db_pool = {
+        "pool_size": getattr(pool, "size", lambda: settings.DB_POOL_SIZE)(),
+        "checked_in": getattr(pool, "checkedin", lambda: 0)(),
+        "checked_out": getattr(pool, "checkedout", lambda: 0)(),
+        "overflow": getattr(pool, "overflow", lambda: 0)(),
+    }
+    oltp_orders = 0
+    try:
+        with engine.connect() as conn:
+            oltp_orders = int(conn.execute(text("SELECT COUNT(*) FROM orders")).scalar() or 0)
+    except Exception:
+        pass
+
+    redis_stock_p1 = None
+    try:
+        redis_stock_p1 = inventory_service.get_stock(1)
+    except Exception:
+        pass
+
+    return {
+        "app": settings.APP_NAME,
+        "concurrency_mode": settings.CONCURRENCY_MODE,
+        "uptime_seconds": snap["uptime_seconds"],
+        "counters": snap["counters"],
+        "db_pool": db_pool,
+        "oltp_orders_total": oltp_orders,
+        "product_1_redis_stock": redis_stock_p1,
+    }
+
+
 @app.get("/health", tags=["Health"])
 async def health_check():
     """System liveness and readiness probe for container orchestrators."""
@@ -137,6 +189,25 @@ async def health_check():
         "concurrency_mode": settings.CONCURRENCY_MODE,
         "services": services,
     }
+
+
+@app.get("/metrics", tags=["Observability"])
+async def metrics_endpoint(format: str = "json"):
+    """Exposes runtime telemetry in JSON or Prometheus text exposition format (`?format=prometheus`)."""
+    data = await run_in_threadpool(_collect_system_metrics)
+    if format.lower() == "prometheus":
+        lines = [
+            f"flashlogix_uptime_seconds {data['uptime_seconds']}",
+            f"flashlogix_oltp_orders_total {data['oltp_orders_total']}",
+            f"flashlogix_db_pool_checked_out {data['db_pool']['checked_out']}",
+            f"flashlogix_db_pool_checked_in {data['db_pool']['checked_in']}",
+        ]
+        if data["product_1_redis_stock"] is not None:
+            lines.append(f"flashlogix_product_1_redis_stock {data['product_1_redis_stock']}")
+        for k, v in sorted(data["counters"].items()):
+            lines.append(f"flashlogix_{k} {v}")
+        return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
+    return data
 
 
 app.include_router(api_v1_router)

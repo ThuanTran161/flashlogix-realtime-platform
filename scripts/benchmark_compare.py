@@ -16,6 +16,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List
 
+from confluent_kafka import Producer
 from confluent_kafka.admin import AdminClient, NewTopic
 from loguru import logger
 from sqlalchemy import text
@@ -25,7 +26,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from app.core.config import settings
-from app.core.database import Base, engine
+from app.core.database import engine, ensure_oltp_schema_and_constraints
 from app.core.storage import ensure_lakehouse_bucket, get_s3_client
 from app.services.inventory_service import redis_client
 from app.services.kafka_producer import EventPublisher
@@ -40,7 +41,7 @@ def wait_for_health(base_url: str, timeout_sec: float = 30.0) -> None:
             with urllib.request.urlopen(f"{base_url}/health", timeout=2.0) as resp:
                 if resp.status == 200:
                     # Allow all multi-worker Uvicorn processes to finish binding on Windows
-                    time.sleep(1.5)
+                    time.sleep(2.5)
                     return
         except Exception:
             pass
@@ -48,10 +49,29 @@ def wait_for_health(base_url: str, timeout_sec: float = 30.0) -> None:
     raise RuntimeError(f"Server at {base_url} failed health check within {timeout_sec}s.")
 
 
+def _stop_server_process(proc: subprocess.Popen) -> None:
+    """Terminates Uvicorn supervisor and all child worker processes cleanly."""
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            capture_output=True,
+            text=True,
+        )
+    else:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    time.sleep(1.5)
+
+
 def reset_clean_environment(initial_stock: int = 100) -> None:
-    """Resets OLTP, Gold Star Schema, Redis, MinIO prefixes, and Kafka topic cleanly."""
-    logger.info("[RESET] Cleaning PostgreSQL OLTP/Gold, Redis, MinIO, and Kafka topic...")
-    Base.metadata.create_all(bind=engine)
+    """Resets OLTP, Gold Star Schema, Redis, MinIO prefixes, and Kafka topics cleanly."""
+    logger.info("[RESET] Cleaning PostgreSQL OLTP/Gold, Redis, MinIO, and Kafka topics...")
+    ensure_oltp_schema_and_constraints()
     with engine.begin() as conn:
         for table in [
             "Fact_Flash_Sale_Orders",
@@ -82,9 +102,9 @@ def reset_clean_environment(initial_stock: int = 100) -> None:
             s3.delete_objects(Bucket=settings.MINIO_BUCKET, Delete={"Objects": objs})
 
     admin = AdminClient({"bootstrap.servers": settings.KAFKA_BOOTSTRAP_SERVERS})
-    topic = settings.KAFKA_TOPIC_ORDERS
+    topics = [settings.KAFKA_TOPIC_ORDERS, settings.KAFKA_TOPIC_ORDERS_DLQ]
     try:
-        fs = admin.delete_topics([topic], operation_timeout=10.0)
+        fs = admin.delete_topics(topics, operation_timeout=10.0)
         for fut in fs.values():
             try:
                 fut.result()
@@ -94,7 +114,9 @@ def reset_clean_environment(initial_stock: int = 100) -> None:
     except Exception:
         pass
 
-    fs_create = admin.create_topics([NewTopic(topic, num_partitions=1, replication_factor=1)])
+    fs_create = admin.create_topics(
+        [NewTopic(t, num_partitions=1, replication_factor=1) for t in topics]
+    )
     for fut in fs_create.values():
         try:
             fut.result()
@@ -147,6 +169,8 @@ def run_single_benchmark(
             str(port),
             "--workers",
             "4",
+            "--backlog",
+            "4096",
             "--log-level",
             "warning",
         ],
@@ -207,11 +231,7 @@ def run_single_benchmark(
                 conn.execute(text("SELECT stock FROM products WHERE id = 1")).scalar() or 0
             )
     finally:
-        server_proc.terminate()
-        try:
-            server_proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            server_proc.kill()
+        _stop_server_process(server_proc)
 
     stats_file = Path(f"{csv_prefix}_stats.csv")
     agg_row: Dict[str, Any] = {}
@@ -220,6 +240,12 @@ def run_single_benchmark(
             if row.get("Name") == "Aggregated":
                 agg_row = row
                 break
+
+    failures_file = Path(f"{csv_prefix}_failures.csv")
+    if failures_file.exists():
+        content = failures_file.read_text(encoding="utf-8").strip()
+        if len(content.splitlines()) > 1:
+            logger.warning(f"[LOCUST_FAILURES ({mode})]\n{content}")
 
     total_reqs = int(agg_row.get("Request Count", 0))
     failures = int(agg_row.get("Failure Count", 0))
@@ -256,10 +282,10 @@ def run_single_benchmark(
 
 
 def verify_lakehouse_pipeline(duplicate_inject_count: int = 20) -> Dict[str, Any]:
-    """Runs duplicate injection, Bronze archival, PySpark Silver streaming, and Gold ETL."""
+    """Runs duplicate + poison-pill injection, Bronze/DLQ, PySpark Silver/Quarantine, and Gold ETL."""
     logger.info(
-        f"[LAKEHOUSE_E2E] Injecting {duplicate_inject_count} duplicate Kafka events "
-        f"to test Bronze->Silver->Gold deduplication & parity..."
+        f"[LAKEHOUSE_E2E] Injecting {duplicate_inject_count} duplicate Kafka events + 1 poison-pill "
+        f"payload to test deduplication, DLQ quarantine, and 100% parity..."
     )
     with engine.connect() as conn:
         sample_orders = conn.execute(
@@ -286,12 +312,23 @@ def verify_lakehouse_pipeline(duplicate_inject_count: int = 20) -> Dict[str, Any
         publisher.publish_order_event(dup_event)
     publisher.flush(timeout=5.0)
 
-    # Consume all Kafka events into MinIO Bronze Parquet
+    # Inject 1 malformed JSON poison-pill record into Kafka to prove DLQ resilience
+    raw_producer = Producer({"bootstrap.servers": settings.KAFKA_BOOTSTRAP_SERVERS})
+    raw_producer.produce(
+        topic=settings.KAFKA_TOPIC_ORDERS,
+        value=b"{corrupt_poison_pill_payload",
+    )
+    raw_producer.flush(timeout=5.0)
+
+    # Consume all Kafka events into MinIO Bronze Parquet (routing poison-pill to DLQ + quarantine)
     consumer = OrderAuditConsumer(group_id=f"bench_audit_{uuid.uuid4().hex[:6]}")
     bronze_consumed = consumer.run(batch_size=100, flush_interval_sec=1.5, idle_timeout_sec=4.0)
-    logger.info(f"[LAKEHOUSE_E2E] AuditConsumer archived {bronze_consumed} raw Bronze events.")
+    logger.info(
+        f"[LAKEHOUSE_E2E] AuditConsumer archived {bronze_consumed} valid Bronze events, "
+        f"quarantined={consumer.quarantined_count} poison-pill events."
+    )
 
-    # Run PySpark Structured Streaming in --available-now mode (Kafka -> Silver MinIO)
+    # Run PySpark Structured Streaming in --available-now mode (Kafka -> Silver + Quarantine)
     spark_start = time.perf_counter()
     subprocess.run(
         [
@@ -312,6 +349,7 @@ def verify_lakehouse_pipeline(duplicate_inject_count: int = 20) -> Dict[str, Any
     dq = gold_result["data_quality"]
     dq["spark_microbatch_duration_sec"] = spark_duration_sec
     dq["bronze_consumed_events"] = bronze_consumed
+    dq["dlq_quarantined_events"] = consumer.quarantined_count
     return dq
 
 

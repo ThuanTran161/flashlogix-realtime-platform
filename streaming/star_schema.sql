@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS Dim_Users (
     is_current BOOLEAN DEFAULT TRUE
 );
 
+CREATE INDEX IF NOT EXISTS idx_dim_users_masked_current
+    ON Dim_Users (masked_user_id, is_current);
+
 -- Dim_Products: Product Dimension Table
 CREATE TABLE IF NOT EXISTS Dim_Products (
     product_sk SERIAL PRIMARY KEY,
@@ -32,6 +35,9 @@ CREATE TABLE IF NOT EXISTS Dim_Products (
     category VARCHAR(100),
     base_price DECIMAL(12, 2) NOT NULL
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dim_products_product_id
+    ON Dim_Products (product_id);
 
 -- Fact_Flash_Sale_Orders: Core Flash Sale Transaction Fact Table
 CREATE TABLE IF NOT EXISTS Fact_Flash_Sale_Orders (
@@ -45,3 +51,12 @@ CREATE TABLE IF NOT EXISTS Fact_Flash_Sale_Orders (
     is_fraudulent BOOLEAN DEFAULT FALSE,    -- Flag for automated bot activity
     created_at TIMESTAMP NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_fact_orders_date_product
+    ON Fact_Flash_Sale_Orders (date_key, product_sk);
+
+CREATE INDEX IF NOT EXISTS idx_fact_orders_user_sk
+    ON Fact_Flash_Sale_Orders (user_sk);
+
+CREATE INDEX IF NOT EXISTS idx_fact_orders_fraud
+    ON Fact_Flash_Sale_Orders (is_fraudulent);

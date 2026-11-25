@@ -1,14 +1,28 @@
+from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import SessionLocal, get_db
+from app.core.telemetry import telemetry
 from app.models.product import Product
 from app.schemas.common import StandardResponse
 from app.schemas.product import ProductCreate, ProductResponse, ProductStockInit
 from app.services.inventory_service import inventory_service
 
 router = APIRouter(prefix="/products", tags=["Products"])
+
+
+def _list_products_sync(db: Session) -> List[ProductResponse]:
+    products = db.query(Product).order_by(Product.id.asc()).all()
+    results: List[ProductResponse] = []
+    for p in products:
+        if settings.CONCURRENCY_MODE != "db_only":
+            cached_stock = inventory_service.get_stock(p.id)
+            if cached_stock is not None:
+                p.stock = cached_stock
+        results.append(ProductResponse.model_validate(p))
+    return results
 
 
 def _create_product_sync(payload: ProductCreate, db: Session) -> ProductResponse:
@@ -69,6 +83,20 @@ def _init_stock_sync(product_id: int, initial_stock: int, db: Session) -> dict:
     return {"product_id": product_id, "stock": initial_stock}
 
 
+@router.get(
+    "",
+    response_model=StandardResponse[List[ProductResponse]],
+    summary="List All Products with Real-Time Stock",
+)
+async def list_products(db: Session = Depends(get_db)):
+    items = await run_in_threadpool(_list_products_sync, db)
+    return StandardResponse(
+        success=True,
+        message=f"Retrieved {len(items)} products.",
+        data=items,
+    )
+
+
 @router.post(
     "",
     response_model=StandardResponse[ProductResponse],
@@ -95,6 +123,7 @@ async def get_product(product_id: int):
             product_id
         )
         if meta is not None:
+            telemetry.inc("product_cache_hits_total")
             if cached_stock is not None:
                 meta["stock"] = cached_stock
             return StandardResponse(
@@ -102,6 +131,7 @@ async def get_product(product_id: int):
                 message="Product retrieved from Redis cache.",
                 data=ProductResponse(**meta),
             )
+        telemetry.inc("product_cache_misses_total")
 
     product_resp = await run_in_threadpool(_get_product_sync, product_id)
     return StandardResponse(

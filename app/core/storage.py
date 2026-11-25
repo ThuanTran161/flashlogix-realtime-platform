@@ -13,7 +13,12 @@ def get_s3_client():
         endpoint_url=settings.MINIO_ENDPOINT,
         aws_access_key_id=settings.MINIO_ROOT_USER,
         aws_secret_access_key=settings.MINIO_ROOT_PASSWORD,
-        config=Config(signature_version="s3v4"),
+        config=Config(
+            signature_version="s3v4",
+            connect_timeout=2,
+            read_timeout=15,
+            retries={"max_attempts": 2},
+        ),
         region_name="us-east-1",
     )
 

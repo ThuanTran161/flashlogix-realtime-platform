@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from app.core.config import settings
-from app.core.database import Base, engine
+from app.core.database import SessionLocal, engine, ensure_oltp_schema_and_constraints
 from app.main import app
 from app.schemas.order import OrderCreate
 from app.schemas.product import ProductCreate
@@ -17,7 +17,10 @@ _created_test_product_ids = []
 
 @pytest.fixture(scope="module", autouse=True)
 def setup_test_db():
-    Base.metadata.create_all(bind=engine)
+    ensure_oltp_schema_and_constraints()
+    # Clean up any leftover negative-stock row if an earlier un-constrained run inserted one
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM products WHERE stock < 0"))
     yield
     if _created_test_product_ids:
         with engine.begin() as conn:
@@ -35,17 +38,32 @@ def test_settings_load():
     assert settings.APP_NAME == "FlashLogix"
     assert settings.PORT == 8000
     assert settings.CONCURRENCY_MODE == "redis_async_lazy"
+    assert settings.KAFKA_TOPIC_ORDERS_DLQ == "flashsale.orders.dlq"
     assert "postgresql://" in settings.get_database_url()
 
 
-def test_health_check_endpoint():
-    """Verifies FastAPI health check endpoint reports UP and dependency telemetry."""
-    response = client.get("/health")
+def test_health_and_observability_endpoints():
+    """Verifies /health, X-Request-ID/X-Process-Time-Ms headers, and /metrics (JSON & Prometheus)."""
+    response = client.get("/health", headers={"X-Request-ID": "trace_abc_123"})
     assert response.status_code == 200
+    assert response.headers["X-Request-ID"] == "trace_abc_123"
+    assert float(response.headers["X-Process-Time-Ms"]) >= 0.0
     data = response.json()
     assert data["status"] == "UP"
     assert data["app"] == "FlashLogix"
     assert "services" in data
+
+    m_json = client.get("/metrics")
+    assert m_json.status_code == 200
+    m_data = m_json.json()
+    assert "counters" in m_data
+    assert "db_pool" in m_data
+    assert m_data["counters"]["http_requests_total"] >= 1
+
+    m_prom = client.get("/metrics?format=prometheus")
+    assert m_prom.status_code == 200
+    assert "flashlogix_uptime_seconds" in m_prom.text
+    assert "flashlogix_oltp_orders_total" in m_prom.text
 
 
 def test_pydantic_order_validation():
@@ -99,8 +117,8 @@ def test_redis_atomic_lua_decrement_and_rollback():
     redis_client.delete(f"stock:product:{test_pid}")
 
 
-def test_order_idempotency_and_zero_overselling_flow(monkeypatch):
-    """Integration test: Create product -> Idempotent order -> Oversell prevention -> Lazy DB skip."""
+def test_order_idempotency_query_and_lazy_db_skip(monkeypatch):
+    """Tests Create Product -> List Products -> Order -> Get Order -> Idempotency & Lazy DB Skip."""
     published_events = []
     monkeypatch.setattr(
         event_publisher,
@@ -116,6 +134,11 @@ def test_order_idempotency_and_zero_overselling_flow(monkeypatch):
     product_id = prod_resp.json()["data"]["id"]
     _created_test_product_ids.append(product_id)
 
+    # Verify list products endpoint includes created product
+    list_resp = client.get("/api/v1/products")
+    assert list_resp.status_code == 200
+    assert any(item["id"] == product_id for item in list_resp.json()["data"])
+
     idem_key = f"idem_{uuid.uuid4().hex}"
     headers = {"Idempotency-Key": idem_key}
 
@@ -129,6 +152,11 @@ def test_order_idempotency_and_zero_overselling_flow(monkeypatch):
     order_id_1 = r1.json()["data"]["id"]
     assert r1.json()["data"]["total_amount"] == 99.5
     assert len(published_events) == 1
+
+    # Verify GET /api/v1/orders/{order_id}
+    get_order_resp = client.get(f"/api/v1/orders/{order_id_1}")
+    assert get_order_resp.status_code == 200
+    assert get_order_resp.json()["data"]["id"] == order_id_1
 
     # Patch SessionLocal on the actual modules to prove retries & rejections NEVER touch PostgreSQL
     order_service_mod = sys.modules["app.services.order_service"]
@@ -193,3 +221,19 @@ def test_compensatory_rollback_on_db_failure(monkeypatch):
 
     # Crucial assertion: Redis stock must still be 5 after compensatory INCRBY
     assert inventory_service.get_stock(product_id) == 5
+
+
+def test_db_check_constraint_blocks_negative_stock():
+    """Defense-in-depth: PostgreSQL CheckConstraint rejects negative product stock."""
+    from sqlalchemy.exc import IntegrityError
+    from app.models.product import Product
+
+    db = SessionLocal()
+    try:
+        bad_prod = Product(name="Negative Stock Test", price=10.0, stock=-1)
+        db.add(bad_prod)
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+    finally:
+        db.close()

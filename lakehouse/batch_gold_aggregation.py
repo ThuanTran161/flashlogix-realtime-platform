@@ -3,7 +3,8 @@
 Transforms Lakehouse Bronze/Silver Parquet records from MinIO into the
 PostgreSQL analytical Star Schema (`Dim_Date`, `Dim_Users` with SCD Type 2,
 `Dim_Products`, and `Fact_Flash_Sale_Orders`), enforcing PII masking,
-idempotent fact loading, and automated Data Quality & Reconciliation auditing.
+unified velocity-based fraud flagging, idempotent fact loading, and
+automated Data Quality & Reconciliation auditing.
 """
 import hashlib
 import io
@@ -60,6 +61,19 @@ def read_parquet_prefix_from_minio(prefix: str) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
+
+
+def count_quarantine_objects() -> int:
+    """Counts poison-pill records isolated under MinIO `quarantine/` prefixes."""
+    s3 = get_s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+    count = 0
+    for page in paginator.paginate(Bucket=settings.MINIO_BUCKET, Prefix="quarantine/"):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith(".json") or (key.endswith(".parquet") and obj.get("Size", 0) > 0):
+                count += 1
+    return count
 
 
 def ensure_star_schema_tables(conn: Connection) -> None:
@@ -174,6 +188,50 @@ def upsert_dim_user_scd2(
     return int(row[0])
 
 
+def apply_unified_velocity_fraud_flags(
+    df: pd.DataFrame,
+    bronze_df: Optional[pd.DataFrame] = None,
+    threshold_per_min: Optional[int] = None,
+) -> pd.DataFrame:
+    """Computes unified fraud flags from 1-minute velocity windows + Bronze alerts."""
+    result = df.copy()
+    threshold = (
+        threshold_per_min
+        if threshold_per_min is not None
+        else settings.FRAUD_VELOCITY_THRESHOLD_PER_MIN
+    )
+
+    existing_flag = (
+        result["is_fraudulent"].fillna(False).astype(bool)
+        if "is_fraudulent" in result.columns
+        else pd.Series(False, index=result.index)
+    )
+
+    # Compute 1-minute tumbling window velocity per masked_user_id
+    window_bucket = result["parsed_ts"].dt.floor("1min")
+    orders_in_window = (
+        result.assign(_win=window_bucket)
+        .groupby(["masked_user_id", "_win"])["order_id"]
+        .transform("count")
+    )
+    velocity_flag = orders_in_window >= threshold
+
+    # Merge any Bronze real-time velocity flags recorded by OrderAuditConsumer
+    bronze_flag = pd.Series(False, index=result.index)
+    if bronze_df is not None and not bronze_df.empty and "is_fraudulent" in bronze_df.columns:
+        flagged_order_ids = set(
+            bronze_df.loc[bronze_df["is_fraudulent"].fillna(False).astype(bool), "order_id"]
+            .dropna()
+            .astype(int)
+            .tolist()
+        )
+        if flagged_order_ids:
+            bronze_flag = result["order_id"].astype(int).isin(flagged_order_ids)
+
+    result["is_fraudulent"] = existing_flag | velocity_flag | bronze_flag
+    return result
+
+
 def compute_pii_compliance(df: pd.DataFrame) -> Dict[str, Any]:
     """Verifies zero raw PII exposure and strict 64-hex SHA-256 masking compliance."""
     raw_pii_column_present = "user_id" in df.columns
@@ -231,9 +289,6 @@ def run_gold_etl() -> Dict[str, Any]:
         df["masked_user_id"] = df["user_id"].astype(str).apply(mask_pii)
         df.drop(columns=["user_id"], inplace=True)
 
-    if "is_fraudulent" not in df.columns:
-        df["is_fraudulent"] = False
-
     pii_audit = compute_pii_compliance(df)
     invalid_amount_count = (
         int((df["total_amount"].fillna(-1) <= 0).sum())
@@ -241,9 +296,10 @@ def run_gold_etl() -> Dict[str, Any]:
         else deduplicated_orders
     )
 
-    # Normalize timestamp column
+    # Normalize timestamp column & apply unified 1-minute velocity + Bronze fraud flags
     ts_col = "order_time" if "order_time" in df.columns else "timestamp"
     df["parsed_ts"] = pd.to_datetime(df[ts_col], utc=True).dt.tz_convert(None)
+    df = apply_unified_velocity_fraud_flags(df, bronze_df=bronze_df)
 
     # Compute cumulative spend per masked_user_id for SCD Type 2 tier classification
     user_spend = df.groupby("masked_user_id")["total_amount"].sum().to_dict()
@@ -285,7 +341,8 @@ def run_gold_etl() -> Dict[str, Any]:
                         :order_id, :user_sk, :product_sk, :date_key,
                         :quantity, :total_amount, :latency_ms, :is_fraudulent, :created_at
                     )
-                    ON CONFLICT (order_id) DO NOTHING
+                    ON CONFLICT (order_id)
+                    DO UPDATE SET is_fraudulent = Fact_Flash_Sale_Orders.is_fraudulent OR EXCLUDED.is_fraudulent
                     """
                 ),
                 {
@@ -319,6 +376,7 @@ def run_gold_etl() -> Dict[str, Any]:
     gold_fact_count = int(gold_row[0])
     gold_revenue = round(float(gold_row[1]), 2)
     fraud_flagged_count = int(gold_row[2])
+    quarantined_objects = count_quarantine_objects()
 
     order_parity_pct = (
         round((gold_fact_count / oltp_orders_count) * 100.0, 2)
@@ -363,6 +421,7 @@ def run_gold_etl() -> Dict[str, Any]:
             if raw_lakehouse_records > 0
             else 0.0
         ),
+        "quarantined_objects": quarantined_objects,
         "null_order_id_count": null_order_ids,
         "invalid_amount_count": invalid_amount_count,
         **pii_audit,
@@ -384,8 +443,8 @@ def run_gold_etl() -> Dict[str, Any]:
     logger.info(
         f"[GOLD_ETL] Completed from '{source_layer}' in {etl_duration_sec}s | "
         f"raw={raw_lakehouse_records} -> dedup={deduplicated_orders} "
-        f"(filtered_dups={duplicates_filtered}) | inserted_facts={inserted_facts} | "
-        f"parity={order_parity_pct}% (delta=${revenue_delta}) | "
+        f"(filtered_dups={duplicates_filtered}, quarantine_objs={quarantined_objects}) | "
+        f"fraud_flagged={fraud_flagged_count} | parity={order_parity_pct}% (delta=${revenue_delta}) | "
         f"pii_violations={pii_audit['pii_violations']}"
     )
     return {

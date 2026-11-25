@@ -1,7 +1,7 @@
 from typing import Generator
 from fastapi import HTTPException
 from loguru import logger
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from app.core.config import settings
 
@@ -24,6 +24,33 @@ SessionLocal = sessionmaker(
 )
 
 Base = declarative_base()
+
+
+def ensure_oltp_schema_and_constraints() -> None:
+    """Creates OLTP tables and idempotently enforces defense-in-depth CHECK constraints."""
+    Base.metadata.create_all(bind=engine)
+    constraints = [
+        ("products", "ck_products_stock_non_negative", "CHECK (stock >= 0)"),
+        ("products", "ck_products_price_positive", "CHECK (price > 0)"),
+        ("orders", "ck_orders_quantity_positive", "CHECK (quantity > 0)"),
+        ("orders", "ck_orders_total_non_negative", "CHECK (total_amount >= 0)"),
+    ]
+    with engine.begin() as conn:
+        for table, cname, expr in constraints:
+            conn.execute(
+                text(
+                    f"""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_constraint WHERE conname = '{cname}'
+                        ) THEN
+                            ALTER TABLE {table} ADD CONSTRAINT {cname} {expr};
+                        END IF;
+                    END $$;
+                    """
+                )
+            )
 
 
 def get_db() -> Generator[Session, None, None]:
