@@ -53,6 +53,8 @@ export function PlaygroundTab({ inventory, onRefresh }: Props) {
   const [botCodes, setBotCodes] = useState<number[] | null>(null);
   const [botRunning, setBotRunning] = useState(false);
 
+  const selectedProduct = inventory.find((p) => p.id === selectedPid) ?? inventory[0];
+
   async function handleResetStock() {
     setStockMsg(null);
     const res = await apiRequest(`/api/v1/products/${selectedPid}/init-stock`, {
@@ -196,6 +198,35 @@ export function PlaygroundTab({ inventory, onRefresh }: Props) {
                 {inventory.length === 0 && <option value={1}>#1 (No products yet)</option>}
               </select>
             </div>
+
+            {selectedProduct && (
+              <div className="grid grid-cols-3 gap-2 rounded-md border border-slate-200 bg-slate-50 p-2.5 dark:border-zinc-800 dark:bg-zinc-950">
+                <div>
+                  <div className="text-[11px] text-slate-500 dark:text-zinc-400">PostgreSQL</div>
+                  <div className="font-mono text-base font-semibold num text-slate-900 dark:text-zinc-100">
+                    {selectedProduct.db_stock}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[11px] text-slate-500 dark:text-zinc-400">Redis RAM</div>
+                  <div className="font-mono text-base font-semibold num text-blue-600 dark:text-blue-400">
+                    {selectedProduct.redis_stock ?? "N/A"}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[11px] text-slate-500 dark:text-zinc-400">Trạng thái</div>
+                  <div
+                    className={`font-mono text-xs font-semibold ${
+                      selectedProduct.in_sync
+                        ? "text-emerald-600 dark:text-emerald-400"
+                        : "text-amber-600 dark:text-amber-400"
+                    }`}
+                  >
+                    {selectedProduct.in_sync ? "In Sync" : "Drift"}
+                  </div>
+                </div>
+              </div>
+            )}
 
             <div className="flex items-end gap-2">
               <div className="flex-1">
