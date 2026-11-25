@@ -11,6 +11,8 @@ import sys
 
 os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
 os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
+
+import pyspark
 from loguru import logger
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col
@@ -26,18 +28,22 @@ from streaming.transformations import (
 
 def create_spark_session(app_name: str = "FlashLogix-Realtime-Analytics") -> SparkSession:
     """Initializes SparkSession with Kafka and MinIO S3A connectors."""
+    packages = (
+        f"org.apache.spark:spark-sql-kafka-0-10_2.13:{pyspark.__version__},"
+        "org.apache.hadoop:hadoop-aws:3.5.0"
+    )
     spark = (
         SparkSession.builder.appName(app_name)
-        .config(
-            "spark.jars.packages",
-            "org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.0,"
-            "org.apache.hadoop:hadoop-aws:3.4.0",
-        )
+        .config("spark.driver.host", "127.0.0.1")
+        .config("spark.driver.bindAddress", "127.0.0.1")
+        .config("spark.jars.packages", packages)
         .config("spark.hadoop.fs.s3a.endpoint", settings.MINIO_ENDPOINT)
         .config("spark.hadoop.fs.s3a.access.key", settings.MINIO_ROOT_USER)
         .config("spark.hadoop.fs.s3a.secret.key", settings.MINIO_ROOT_PASSWORD)
         .config("spark.hadoop.fs.s3a.path.style.access", "true")
+        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        .config("spark.sql.shuffle.partitions", "4")
         .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true")
         .getOrCreate()
     )
@@ -45,7 +51,10 @@ def create_spark_session(app_name: str = "FlashLogix-Realtime-Analytics") -> Spa
     return spark
 
 
-def run_streaming_pipeline(starting_offsets: str = "latest") -> None:
+def run_streaming_pipeline(
+    starting_offsets: str = "latest",
+    available_now: bool = False,
+) -> None:
     """Starts the Kafka -> Silver Parquet & Windowed Aggregation streaming queries."""
     ensure_lakehouse_bucket(settings.MINIO_BUCKET)
     spark = create_spark_session()
@@ -57,7 +66,7 @@ def run_streaming_pipeline(starting_offsets: str = "latest") -> None:
 
     logger.info(
         f"[SPARK_STREAM] Connecting to Kafka '{settings.KAFKA_BOOTSTRAP_SERVERS}' "
-        f"topic='{settings.KAFKA_TOPIC_ORDERS}'"
+        f"topic='{settings.KAFKA_TOPIC_ORDERS}' offsets='{starting_offsets}'"
     )
 
     raw_kafka_stream = (
@@ -86,30 +95,42 @@ def run_streaming_pipeline(starting_offsets: str = "latest") -> None:
         col("order_date"),
     )
 
-    silver_query = (
+    silver_writer = (
         secure_silver_orders.writeStream.format("parquet")
         .partitionBy("order_date")
         .option("path", silver_path)
         .option("checkpointLocation", checkpoint_path)
         .outputMode("append")
-        .start()
     )
+    if available_now:
+        silver_writer = silver_writer.trigger(availableNow=True)
+
+    silver_query = silver_writer.start()
     logger.info(
         f"[SPARK_STREAM] Silver sink started -> path='{silver_path}' "
         f"checkpoint='{checkpoint_path}'"
     )
 
     windowed_sales = compute_windowed_sales(secure_silver_orders)
-    console_query = (
+    console_writer = (
         windowed_sales.writeStream.format("console")
         .outputMode("update")
         .option("truncate", "false")
         .option("checkpointLocation", window_checkpoint_path)
-        .start()
     )
+    if available_now:
+        console_writer = console_writer.trigger(availableNow=True)
 
-    logger.info("[SPARK_STREAM] Streaming queries active. Awaiting termination...")
-    spark.streams.awaitAnyTermination()
+    console_query = console_writer.start()
+
+    if available_now:
+        silver_query.awaitTermination()
+        console_query.awaitTermination()
+        logger.info("[SPARK_STREAM] AvailableNow micro-batch completed cleanly.")
+        spark.stop()
+    else:
+        logger.info("[SPARK_STREAM] Continuous streaming queries active. Awaiting termination...")
+        spark.streams.awaitAnyTermination()
 
 
 if __name__ == "__main__":
@@ -120,5 +141,13 @@ if __name__ == "__main__":
         choices=["earliest", "latest"],
         help="Kafka offset strategy on initial run.",
     )
+    parser.add_argument(
+        "--available-now",
+        action="store_true",
+        help="Process all currently available Kafka messages once and exit cleanly.",
+    )
     args = parser.parse_args()
-    run_streaming_pipeline(starting_offsets=args.starting_offsets)
+    run_streaming_pipeline(
+        starting_offsets=args.starting_offsets,
+        available_now=args.available_now,
+    )
