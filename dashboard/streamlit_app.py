@@ -28,7 +28,7 @@ from lakehouse.batch_gold_aggregation import run_gold_etl
 
 st.set_page_config(
     page_title="FlashLogix — Command Center",
-    page_icon="⚡",
+    page_icon=":material/bolt:",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -38,12 +38,17 @@ st.markdown(
     <style>
     .block-container { padding-top: 1.4rem; padding-bottom: 2rem; }
     .status-pill {
-        display: inline-block; padding: 0.25rem 0.7rem; border-radius: 999px;
-        font-size: 0.78rem; font-weight: 600; margin-right: 0.4rem; margin-bottom: 0.3rem;
+        display: inline-flex; align-items: center; gap: 0.4rem;
+        padding: 0.28rem 0.75rem; border-radius: 999px;
+        font-size: 0.78rem; font-weight: 600; margin-right: 0.45rem; margin-bottom: 0.35rem;
     }
-    .pill-ok { background: rgba(16, 185, 129, 0.16); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.4); }
-    .pill-err { background: rgba(239, 68, 68, 0.16); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.4); }
-    .pill-warn { background: rgba(245, 158, 11, 0.16); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.4); }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+    .pill-ok { background: rgba(16, 185, 129, 0.14); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.38); }
+    .pill-ok .status-dot { background: #10b981; }
+    .pill-err { background: rgba(239, 68, 68, 0.14); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.38); }
+    .pill-err .status-dot { background: #ef4444; }
+    .pill-warn { background: rgba(245, 158, 11, 0.14); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.38); }
+    .pill-warn .status-dot { background: #f59e0b; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -182,38 +187,43 @@ def list_quarantine_keys(limit: int = 20) -> List[str]:
 
 def render_pill(label: str, healthy: Optional[bool]) -> str:
     if healthy is True:
-        return f"<span class='status-pill pill-ok'>● {label}: ONLINE</span>"
+        return f"<span class='status-pill pill-ok'><span class='status-dot'></span>{label}: ONLINE</span>"
     if healthy is False:
-        return f"<span class='status-pill pill-err'>● {label}: OFFLINE</span>"
-    return f"<span class='status-pill pill-warn'>● {label}: CHECKING</span>"
+        return f"<span class='status-pill pill-err'><span class='status-dot'></span>{label}: OFFLINE</span>"
+    return f"<span class='status-pill pill-warn'><span class='status-dot'></span>{label}: CHECKING</span>"
 
 
 # ----------------------------------------------------------------------
 # Sidebar Control Center
 # ----------------------------------------------------------------------
 with st.sidebar:
-    st.header("🎛️ Command Center")
+    st.header(":material/tune: Command Center")
     api_base_url = st.text_input("FastAPI Endpoint", value="http://127.0.0.1:8000")
-    if st.button("🔄 Làm mới dữ liệu", width="stretch", type="primary"):
+    if st.button(
+        "Làm mới dữ liệu",
+        icon=":material/refresh:",
+        width="stretch",
+        type="primary",
+    ):
         st.rerun()
 
     st.divider()
-    st.subheader("🔗 Truy cập nhanh")
+    st.subheader(":material/link: Truy cập nhanh")
     st.markdown(
         f"- [Swagger API Docs]({api_base_url.rstrip('/')}/docs)\n"
-        f"- [Telemetry JSON](/metrics) → `{api_base_url.rstrip('/')}/metrics`\n"
-        "- MinIO Console: `http://localhost:9001`"
+        f"- [Telemetry JSON]({api_base_url.rstrip('/')}/metrics)\n"
+        "- [MinIO Console](http://localhost:9001)"
     )
     st.caption(
-        "Mẹo: Dùng `.\u005crun.ps1` để bật toàn bộ hệ thống chỉ với 1 dòng lệnh, "
-        "và `.\u005crun.ps1 stop` để tắt gọn."
+        "Mẹo: Dùng `.\\run.ps1` để bật toàn bộ hệ thống chỉ với 1 dòng lệnh, "
+        "và `.\\run.ps1 stop` để tắt gọn."
     )
 
 
 # ----------------------------------------------------------------------
 # Header & Live Infrastructure Status Strip
 # ----------------------------------------------------------------------
-st.title("⚡ FlashLogix — Transaction Engine & Lakehouse Command Center")
+st.title(":material/bolt: FlashLogix — Transaction Engine & Lakehouse")
 st.caption(
     "Điều khiển tập trung API hiệu năng cao (Redis Lua + Lazy DB + Outbox), "
     "Kafka DLQ, PySpark Streaming, Gold Star Schema và Data Quality SLA."
@@ -264,15 +274,15 @@ k5.metric(
 )
 
 # ----------------------------------------------------------------------
-# 5 Interactive Control Tabs
+# 5 Interactive Control Tabs (Material Symbols Icons)
 # ----------------------------------------------------------------------
 tab_ctrl, tab_metrics, tab_outbox, tab_lake, tab_dq = st.tabs(
     [
-        "⚡ Điều Khiển & Test Nhanh",
-        "📊 Telemetry & OLTP",
-        "📨 Outbox & Kafka DLQ",
-        "🗄️ Lakehouse & Gold ETL",
-        "🛡️ Data Quality SLA",
+        ":material/play_circle: Điều Khiển & Test",
+        ":material/monitoring: Telemetry & OLTP",
+        ":material/mark_email_read: Outbox & Kafka DLQ",
+        ":material/database: Lakehouse & Gold ETL",
+        ":material/verified_user: Data Quality SLA",
     ]
 )
 
@@ -282,7 +292,7 @@ with tab_ctrl:
 
     with col_inv:
         with st.container(border=True):
-            st.subheader("📦 Quản lý Kho & Sản phẩm")
+            st.subheader(":material/inventory_2: Quản lý Kho & Sản phẩm")
             if not products_df.empty:
                 prod_options = {
                     f"#{int(r.id)} — {r.name} (DB={int(r.stock)}, Redis={inventory_service.get_stock(int(r.id))})": int(
@@ -296,7 +306,12 @@ with tab_ctrl:
                 selected_pid = st.number_input("Product ID", min_value=1, value=1, step=1)
 
             reset_stock_val = st.number_input("Số lượng tồn kho mới", min_value=0, value=100, step=10)
-            if st.button("🔄 Nạp / Reset Kho (DB + Redis)", width="stretch", disabled=not api_online):
+            if st.button(
+                "Nạp / Reset Kho (DB + Redis)",
+                icon=":material/sync:",
+                width="stretch",
+                disabled=not api_online,
+            ):
                 code, body, _, ms = api_request(
                     api_base_url,
                     "POST",
@@ -309,12 +324,12 @@ with tab_ctrl:
                 else:
                     st.error(f"Lỗi ({code}): {body}")
 
-            with st.expander("➕ Tạo sản phẩm mới"):
+            with st.expander("Tạo sản phẩm mới", icon=":material/add_circle:"):
                 new_p_name = st.text_input("Tên sản phẩm", value="FlashLogix Gaming Mouse X1")
                 c_price, c_stock = st.columns(2)
                 new_p_price = c_price.number_input("Giá ($)", min_value=1.0, value=79.99, step=5.0)
                 new_p_stock = c_stock.number_input("Tồn kho ban đầu", min_value=0, value=50, step=10)
-                if st.button("Tạo sản phẩm", width="stretch", disabled=not api_online):
+                if st.button("Tạo sản phẩm", icon=":material/add_circle:", width="stretch", disabled=not api_online):
                     code, body, _, _ = api_request(
                         api_base_url,
                         "POST",
@@ -333,7 +348,7 @@ with tab_ctrl:
 
     with col_ord:
         with st.container(border=True):
-            st.subheader("🛒 Đặt Đơn Trực Tiếp & Test Idempotency")
+            st.subheader(":material/shopping_cart: Đặt Đơn Trực Tiếp & Test Idempotency")
             if "ui_idem_key" not in st.session_state:
                 st.session_state["ui_idem_key"] = f"ui_{uuid.uuid4().hex[:12]}"
 
@@ -346,12 +361,20 @@ with tab_ctrl:
 
             ik1, ik2 = st.columns([3, 1])
             idem_val = ik1.text_input("Idempotency-Key", key="ui_idem_key")
-            if ik2.button("🎲 Key mới", width="stretch"):
-                st.session_state["ui_idem_key"] = f"ui_{uuid.uuid4().hex[:12]}"
-                st.rerun()
+            with ik2:
+                st.write("")
+                if st.button("Key mới", icon=":material/autorenew:", width="stretch"):
+                    st.session_state["ui_idem_key"] = f"ui_{uuid.uuid4().hex[:12]}"
+                    st.rerun()
 
             st.caption("Giữ nguyên Idempotency-Key và bấm Đặt Đơn 2 lần để kiểm chứng chống trừ kho kép.")
-            if st.button("🚀 Gửi Đơn Hàng (POST /orders)", width="stretch", type="primary", disabled=not api_online):
+            if st.button(
+                "Gửi Đơn Hàng (POST /orders)",
+                icon=":material/send:",
+                width="stretch",
+                type="primary",
+                disabled=not api_online,
+            ):
                 code, body, hdrs, ms = api_request(
                     api_base_url,
                     "POST",
@@ -375,7 +398,7 @@ with tab_ctrl:
                 st.json(body)
 
     with st.container(border=True):
-        st.subheader("🔥 Giả Lập Tải Cao & Bot Fraud Ngay Trên UI")
+        st.subheader(":material/speed: Giả Lập Tải Cao & Bot Fraud")
         sim1, sim2 = st.columns(2)
 
         with sim1:
@@ -383,7 +406,12 @@ with tab_ctrl:
             b_col1, b_col2 = st.columns(2)
             burst_total = b_col1.slider("Tổng số requests", min_value=10, max_value=120, value=40, step=10)
             burst_workers = b_col2.slider("Số luồng đồng thời", min_value=2, max_value=30, value=15, step=1)
-            if st.button("⚡ Bắn Burst Flash Sale", width="stretch", disabled=not api_online):
+            if st.button(
+                "Bắn Burst Flash Sale",
+                icon=":material/flash_on:",
+                width="stretch",
+                disabled=not api_online,
+            ):
                 def _fire_once(idx: int) -> Tuple[int, float]:
                     c, _, _, m = api_request(
                         api_base_url,
@@ -421,7 +449,12 @@ with tab_ctrl:
         with sim2:
             st.markdown("**2) Bot Velocity Fraud Test (>= 5 đơn/phút)**")
             bot_uid = st.text_input("Bot User ID giả lập", value="bot_attacker_999")
-            if st.button("🤖 Bắn 6 Đơn Bot Liên Tiếp", width="stretch", disabled=not api_online):
+            if st.button(
+                "Bắn 6 Đơn Bot Liên Tiếp",
+                icon=":material/security:",
+                width="stretch",
+                disabled=not api_online,
+            ):
                 bot_codes = []
                 for idx in range(6):
                     sc, _, _, _ = api_request(
@@ -438,7 +471,7 @@ with tab_ctrl:
                     bot_codes.append(sc)
                 st.warning(
                     f"Đã gửi 6 đơn từ `{bot_uid}` -> HTTP codes: {bot_codes}. "
-                    "Hãy qua tab **Lakehouse & Gold ETL** chạy Gold ETL để thấy `Fraud Flagged` tăng!"
+                    "Hãy qua tab **Lakehouse & Gold ETL** chạy Gold ETL để thấy `Fraud Flagged` tăng."
                 )
 
 
@@ -488,7 +521,7 @@ with tab_metrics:
         st.info("Bật FastAPI server để xem biểu đồ `/metrics` trực tiếp từ 4 workers.")
 
     st.divider()
-    st.subheader("📦 Tồn kho Realtime (PostgreSQL vs Redis RAM)")
+    st.subheader(":material/warehouse: Tồn kho Realtime (PostgreSQL vs Redis RAM)")
     if not products_df.empty:
         inv_view = products_df.copy()
         inv_view["redis_ram_stock"] = inv_view["id"].apply(inventory_service.get_stock)
@@ -497,7 +530,7 @@ with tab_metrics:
     else:
         st.info("Chưa có sản phẩm nào trong DB.")
 
-    st.subheader("🧾 Lịch sử Đơn hàng gần đây (OLTP)")
+    st.subheader(":material/receipt_long: Lịch sử Đơn hàng gần đây (OLTP)")
     f1, f2 = st.columns(2)
     filter_uid = f1.text_input("Lọc theo user_id (để trống = tất cả)", value="")
     filter_pid = f2.number_input("Lọc theo product_id (0 = tất cả)", min_value=0, value=0, step=1)
@@ -519,7 +552,12 @@ with tab_outbox:
     ob3.metric("FAILED", f"{outbox_counts.get('FAILED', 0):,}")
     with ob4:
         st.write("")
-        if st.button("🔁 Replay Outbox Events", width="stretch", disabled=not api_online):
+        if st.button(
+            "Replay Outbox Events",
+            icon=":material/replay:",
+            width="stretch",
+            disabled=not api_online,
+        ):
             code, body, _, _ = api_request(
                 api_base_url, "POST", "/api/v1/orders/outbox/replay?limit=200"
             )
@@ -532,7 +570,7 @@ with tab_outbox:
     st.dataframe(outbox_df, width="stretch")
 
     st.divider()
-    st.subheader("☣️ Poison-Pill Quarantine / Dead-Letter Queue (MinIO)")
+    st.subheader(":material/report_problem: Poison-Pill Quarantine / Dead-Letter Queue (MinIO)")
     try:
         q_keys = list_quarantine_keys(limit=20)
         if q_keys:
@@ -551,11 +589,16 @@ with tab_outbox:
 
 # === TAB 4: LAKEHOUSE & GOLD STAR SCHEMA ETL ===
 with tab_lake:
-    st.subheader("⚙️ Điều khiển Pipeline Lakehouse (Silver & Gold)")
+    st.subheader(":material/account_tree: Điều khiển Pipeline Lakehouse (Silver & Gold)")
     etl_c1, etl_c2, etl_c3 = st.columns([1.2, 1.0, 1.2])
 
     with etl_c1:
-        if st.button("⚙️ Chạy PySpark Silver (--available-now)", width="stretch"):
+        st.write("")
+        if st.button(
+            "Chạy PySpark Silver (--available-now)",
+            icon=":material/stream:",
+            width="stretch",
+        ):
             with st.status("Đang chạy PySpark Structured Streaming (Kafka -> Silver UTC)...", expanded=True) as status_box:
                 t0 = time.perf_counter()
                 proc = subprocess.run(
@@ -587,7 +630,12 @@ with tab_lake:
     )
     with etl_c3:
         st.write("")
-        if st.button("⭐ Chạy Gold Star Schema ETL", width="stretch", type="primary"):
+        if st.button(
+            "Chạy Gold Star Schema ETL",
+            icon=":material/layers:",
+            width="stretch",
+            type="primary",
+        ):
             target = prune_date.strip() or None
             with st.spinner(f"Đang chạy Gold ETL (target_date={target or 'ALL'})..."):
                 res = run_gold_etl(target_date=target)
@@ -601,7 +649,7 @@ with tab_lake:
     st.divider()
     lake_col, gold_col = st.columns(2)
     with lake_col:
-        st.subheader("🗄️ Tầng Dữ Liệu MinIO Medallion")
+        st.subheader(":material/storage: Tầng Dữ Liệu MinIO Medallion")
         try:
             lake_counts = count_lakehouse_objects()
             lake_df = pd.DataFrame(
@@ -612,7 +660,7 @@ with tab_lake:
             st.warning(f"MinIO chưa sẵn sàng: {exc}")
 
     with gold_col:
-        st.subheader("⭐ Gold Star Schema & SCD Type 2")
+        st.subheader(":material/schema: Gold Star Schema & SCD Type 2")
         try:
             (gold_orders, gold_rev, fraud_cnt), tiers_df = load_gold_metrics()
             g1, g2, g3 = st.columns(3)
@@ -627,7 +675,7 @@ with tab_lake:
 
 # === TAB 5: DATA QUALITY SLA AUDIT ===
 with tab_dq:
-    st.subheader("🛡️ Data Quality & Lakehouse Reconciliation SLA")
+    st.subheader(":material/verified_user: Data Quality & Lakehouse Reconciliation SLA")
     try:
         dq = load_data_quality_report()
         d1, d2, d3, d4, d5 = st.columns(5)
