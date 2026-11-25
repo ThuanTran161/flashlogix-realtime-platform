@@ -64,6 +64,7 @@
 * **Unified Velocity Fraud Detection (Consumer -> Silver -> Gold):** Both `OrderAuditConsumer` (real-time Redis sliding 60s window) and `batch_gold_aggregation.py` (`apply_unified_velocity_fraud_flags`, >= `FRAUD_VELOCITY_THRESHOLD_PER_MIN` per minute) propagate `is_fraudulent` into `Fact_Flash_Sale_Orders` via idempotent upsert.
 * **PySpark Structured Streaming & PII Governance:** Enforces explicit `StructType` schemas, strict `UTC` session partitioning (`order_date=YYYY-MM-DD/`), hashes customer PII (`user_id` -> `masked_user_id`) using salted SHA-256, deduplicates by `order_id`, and computes 1-minute tumbling window aggregations with watermarking.
 * **Partition-Pruned Batch Bulk Gold Star Schema & DQ Audit:** `lakehouse/batch_gold_aggregation.py` supports incremental date-partition pruning (`--date YYYY-MM-DD`) and set-based `executemany` bulk upserts into indexed `Dim_Date`, `Dim_Products`, SCD Type 2 `Dim_Users`, and `Fact_Flash_Sale_Orders`, exporting an automated reconciliation & PII audit report (`gold/data_quality_report/latest.json`).
+* **1-Command All-in-One Launcher & Interactive Command Center:** `run.ps1` orchestrates the isolated Docker stack, schema/seed sync, 4-worker Uvicorn API, Kafka `OrderAuditConsumer`, and the 5-tab Streamlit Command Center (`dashboard/streamlit_app.py`) for visual order testing, burst/bot simulations, Outbox replay, and Silver/Gold ETL triggers.
 * **Hardened Container & CI/CD:** Non-root `Dockerfile` (`appuser`) with `HEALTHCHECK` and multi-worker `uvicorn`, paired with `.github/workflows/ci.yml` (`ruff check` + `pytest tests/ -v`).
 
 ---
@@ -125,13 +126,14 @@ Flashlogix_Platform/
 ├── lakehouse/
 │   └── batch_gold_aggregation.py # Partition-pruned batch bulk Gold Star Schema ETL + DQ Audit
 ├── dashboard/
-│   └── streamlit_app.py        # Real-time OLTP, Lakehouse, Quarantine/DLQ & DQ SLA monitor
+│   └── streamlit_app.py        # Interactive 5-tab Command Center UI (Controls, Telemetry, Outbox/DLQ, ETL, DQ)
 ├── scripts/
 │   └── benchmark_compare.py    # Automated Before/After Locust benchmark & Lakehouse E2E verifier
 ├── tests/
 │   ├── test_backend.py         # Observability, query APIs, Outbox replay, Idempotency, Lazy DB & CHECK tests
 │   ├── test_streaming_and_gold.py # PySpark quarantine/PII, DLQ validation, unified fraud, SCD2 & batch upsert tests
 │   └── locustfile.py           # High-concurrency Locust load testing suite
+├── run.ps1                     # 1-command All-in-One launcher (start / stop / down / status / test / bench)
 ├── docker-compose.yml          # Isolated Postgres (5433), Redis (6380), Kafka (9094), MinIO (9000)
 ├── Dockerfile                  # Non-root production FastAPI container with HEALTHCHECK
 ├── pyproject.toml              # Pytest & Ruff configuration
@@ -142,43 +144,43 @@ Flashlogix_Platform/
 
 ## 5. Quickstart Guide
 
-### Step 1: Configure Environment & Start Infrastructure
+### Option A: 1-Command All-in-One Launcher (Recommended)
+
+Start the entire FlashLogix stack (**isolated Docker containers + DB/Redis seed + 4-worker FastAPI + Kafka AuditConsumer + Interactive Command Center UI**) with a single command:
+
 ```powershell
-Copy-Item .env.example .env
-docker compose up -d
+.\run.ps1
 ```
+
+Once ready, your browser opens **`http://localhost:8501`** (5-tab Command Center for live orders, burst & bot simulation, Outbox replay, Silver/Gold ETL triggers, and Data Quality SLA audit).
+
+| Command | Action |
+| :--- | :--- |
+| `.\run.ps1` (or `.\run.ps1 start`) | Starts Docker (`flashlogix_*`), syncs schema/stock, launches 4-worker API (`:8000`), `AuditConsumer`, and Streamlit UI (`:8501`) |
+| `.\run.ps1 status` | Checks `flashlogix_*` container health and running app PIDs |
+| `.\run.ps1 stop` | Cleanly stops FastAPI, `AuditConsumer`, and Streamlit (keeps Docker & persisted data running) |
+| `.\run.ps1 down` | Stops app processes and runs `docker compose down` for FlashLogix only |
+| `.\run.ps1 test` | Runs `ruff check` + full `pytest tests/ -v` suite |
+| `.\run.ps1 bench` | Runs the automated 300-VU Locust Before/After benchmark + Lakehouse E2E verification |
+
 > **Port Isolation:** Services run on `5433` (Postgres), `6380` (Redis), `9094` (Kafka), and `9000/9001` (MinIO) inside the dedicated `flashlogix_net` bridge network.
 
-### Step 2: Run Automated Linter & Test Suite (14/14 Tests)
+### Option B: Manual Component Execution (Advanced)
+
 ```powershell
-.\.venv\Scripts\python.exe -m ruff check app streaming lakehouse scripts tests
+# 1. Start infrastructure & run test suite
+Copy-Item .env.example .env
+docker compose up -d
+.\.venv\Scripts\python.exe -m ruff check app streaming lakehouse scripts dashboard tests
 .\.venv\Scripts\python.exe -m pytest tests/ -v
-```
 
-### Step 3: Start Backend API & Inspect Observability
-```powershell
+# 2. Run API (http://localhost:8000/docs, /health, /metrics) & AuditConsumer
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
-```
-* Swagger UI: `http://localhost:8000/docs`
-* Health Probe: `http://localhost:8000/health`
-* Telemetry Metrics: `http://localhost:8000/metrics` and `http://localhost:8000/metrics?format=prometheus`
-
-### Step 4: Run Automated Before-vs-After Benchmark & E2E Lakehouse Verification
-```powershell
-.\.venv\Scripts\python.exe scripts/benchmark_compare.py --reset-clean --verify-lakehouse
-```
-
-### Step 5: Run Streaming Consumers, Gold Star Schema ETL & Dashboard
-```powershell
-# Kafka Audit, DLQ & Bronze Parquet Consumer
 .\.venv\Scripts\python.exe -m streaming.audit_consumer
 
-# PySpark Structured Streaming (Kafka -> Silver + Quarantine Parquet on MinIO)
+# 3. Run PySpark Silver Streaming, Gold Star Schema ETL, Benchmark, or Dashboard
 .\.venv\Scripts\python.exe -m streaming.spark_stream_orders --starting-offsets earliest
-
-# Gold Layer Kimball Star Schema, SCD Type 2 & Data Quality Audit (optional --date YYYY-MM-DD pruning)
 .\.venv\Scripts\python.exe -m lakehouse.batch_gold_aggregation
-
-# Real-Time Monitoring & Data Quality Dashboard
+.\.venv\Scripts\python.exe scripts/benchmark_compare.py --reset-clean --verify-lakehouse
 .\.venv\Scripts\python.exe -m streamlit run dashboard/streamlit_app.py
 ```

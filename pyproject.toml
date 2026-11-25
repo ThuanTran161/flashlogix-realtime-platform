@@ -18,3 +18,4 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "scripts/benchmark_compare.py" = ["E402"]
+"dashboard/streamlit_app.py" = ["E402"]
