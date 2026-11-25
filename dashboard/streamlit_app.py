@@ -55,6 +55,10 @@ st.markdown(
 )
 
 
+def _regenerate_idem_key() -> None:
+    st.session_state["ui_idem_key"] = f"ui_{uuid.uuid4().hex[:12]}"
+
+
 def api_request(
     base_url: str,
     method: str,
@@ -210,9 +214,9 @@ with st.sidebar:
     st.divider()
     st.subheader(":material/link: Truy cập nhanh")
     st.markdown(
-        f"- [Swagger API Docs]({api_base_url.rstrip('/')}/docs)\n"
-        f"- [Telemetry JSON]({api_base_url.rstrip('/')}/metrics)\n"
-        "- [MinIO Console](http://localhost:9001)"
+        f"- **[Swagger API Docs]({api_base_url.rstrip('/')}/docs)** — Xem & test từng API endpoint\n"
+        f"- **[Telemetry JSON]({api_base_url.rstrip('/')}/metrics)** — Số liệu hiệu năng 4 workers\n"
+        "- **[MinIO Console](http://localhost:9001)** — Kho dữ liệu Lakehouse (`minioadmin` / `minioadminpassword`)"
     )
     st.caption(
         "Mẹo: Dùng `.\\run.ps1` để bật toàn bộ hệ thống chỉ với 1 dòng lệnh, "
@@ -350,7 +354,7 @@ with tab_ctrl:
         with st.container(border=True):
             st.subheader(":material/shopping_cart: Đặt Đơn Trực Tiếp & Test Idempotency")
             if "ui_idem_key" not in st.session_state:
-                st.session_state["ui_idem_key"] = f"ui_{uuid.uuid4().hex[:12]}"
+                _regenerate_idem_key()
 
             o_col1, o_col2 = st.columns(2)
             order_pid = o_col1.number_input(
@@ -363,9 +367,12 @@ with tab_ctrl:
             idem_val = ik1.text_input("Idempotency-Key", key="ui_idem_key")
             with ik2:
                 st.write("")
-                if st.button("Key mới", icon=":material/autorenew:", width="stretch"):
-                    st.session_state["ui_idem_key"] = f"ui_{uuid.uuid4().hex[:12]}"
-                    st.rerun()
+                st.button(
+                    "Key mới",
+                    icon=":material/autorenew:",
+                    width="stretch",
+                    on_click=_regenerate_idem_key,
+                )
 
             st.caption("Giữ nguyên Idempotency-Key và bấm Đặt Đơn 2 lần để kiểm chứng chống trừ kho kép.")
             if st.button(
